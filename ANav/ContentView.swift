@@ -20,6 +20,18 @@ struct ContentView: View {
                     }
                 }
             }
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 1)
+                    .onChanged { _ in
+                        viewModel.handleMapInteraction()
+                    }
+            )
+            .simultaneousGesture(
+                MagnifyGesture()
+                    .onChanged { _ in
+                        viewModel.handleMapInteraction()
+                    }
+            )
             .ignoresSafeArea()
 
             VStack(spacing: 14) {
@@ -56,6 +68,11 @@ struct ContentView: View {
                     LegendItem(label: "GPS", color: Color(red: 0.13, green: 0.56, blue: 0.95))
                     LegendItem(label: "Inertial", color: Color(red: 0.97, green: 0.45, blue: 0.15))
                     Spacer()
+                    Button(action: viewModel.recenterMap) {
+                        Label("Recenter", systemImage: "scope")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .buttonStyle(.plain)
                     Text(viewModel.referenceFrameText)
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.secondary)

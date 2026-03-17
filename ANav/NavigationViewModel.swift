@@ -72,6 +72,7 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
     private var inertialVelocityMetersPerSecond = SIMD2<Double>(repeating: 0)
     private var lastMotionTimestamp: TimeInterval?
     private var motionHeadingDegrees: Double?
+    private var shouldAutoCenterMap = true
 
     func start() {
         guard !hasStarted else { return }
@@ -101,6 +102,15 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         updateDerivedReadouts()
         updateAnnotations()
         updateRegion()
+    }
+
+    func recenterMap() {
+        shouldAutoCenterMap = true
+        updateRegion()
+    }
+
+    func handleMapInteraction() {
+        shouldAutoCenterMap = false
     }
 
     func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
@@ -350,7 +360,10 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
 
         let nextRegion = MKCoordinateRegion(center: center, span: span(for: radiusMeters, at: center))
         region = nextRegion
-        cameraPosition = .region(nextRegion)
+
+        if shouldAutoCenterMap {
+            cameraPosition = .region(nextRegion)
+        }
     }
 
     private func bestReferenceFrame() -> CMAttitudeReferenceFrame {
