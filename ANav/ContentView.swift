@@ -10,6 +10,9 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var viewModel = NavigationViewModel()
+    @State private var isPanelMinimized = false
+    @State private var panelHeight: CGFloat = 0
+    @GestureState private var panelDragTranslation: CGFloat = 0
 
     var body: some View {
         ZStack(alignment: .bottom) {
@@ -35,12 +38,15 @@ struct ContentView: View {
             .ignoresSafeArea()
 
             VStack(spacing: 14) {
-                Text(viewModel.statusText)
-                    .font(.footnote.weight(.semibold))
-                    .foregroundStyle(.primary)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 8)
-                    .background(.ultraThinMaterial, in: Capsule())
+                Capsule()
+                    .fill(Color.secondary.opacity(0.45))
+                    .frame(width: 42, height: 5)
+                    .padding(.top, 2)
+                    .onTapGesture {
+                        withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
+                            isPanelMinimized.toggle()
+                        }
+                    }
 
                 HStack(spacing: 10) {
                     ForEach(MovementMode.allCases) { mode in
@@ -127,10 +133,56 @@ struct ContentView: View {
                 RoundedRectangle(cornerRadius: 28, style: .continuous)
                     .strokeBorder(Color.white.opacity(0.35), lineWidth: 1)
             )
+            .background(
+                GeometryReader { geometry in
+                    Color.clear
+                        .preference(key: PanelHeightPreferenceKey.self, value: geometry.size.height)
+                }
+            )
+            .onPreferenceChange(PanelHeightPreferenceKey.self) { panelHeight = $0 }
+            .offset(y: panelOffset)
+            .gesture(panelDragGesture)
+            .animation(.spring(response: 0.28, dampingFraction: 0.84), value: isPanelMinimized)
             .padding(.horizontal, 16)
             .padding(.bottom, 20)
         }
         .onAppear(perform: viewModel.start)
+    }
+
+    private var minimizedOffset: CGFloat {
+        max(panelHeight - 74, 0)
+    }
+
+    private var panelOffset: CGFloat {
+        let restingOffset = isPanelMinimized ? minimizedOffset : 0
+        return min(max(restingOffset + panelDragTranslation, 0), minimizedOffset)
+    }
+
+    private var panelDragGesture: some Gesture {
+        DragGesture(minimumDistance: 8)
+            .updating($panelDragTranslation) { value, state, _ in
+                state = value.translation.height
+            }
+            .onEnded { value in
+                let shouldMinimize = value.translation.height > 60
+                let shouldMaximize = value.translation.height < -60
+
+                withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
+                    if shouldMinimize {
+                        isPanelMinimized = true
+                    } else if shouldMaximize {
+                        isPanelMinimized = false
+                    }
+                }
+            }
+    }
+}
+
+private struct PanelHeightPreferenceKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
     }
 }
 
