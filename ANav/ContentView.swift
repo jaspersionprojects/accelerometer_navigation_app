@@ -17,6 +17,18 @@ struct ContentView: View {
     var body: some View {
         ZStack(alignment: .bottom) {
             Map(position: $viewModel.cameraPosition) {
+                if viewModel.areTrailsVisible {
+                    if viewModel.gpsTrailCoordinates.count >= 2 {
+                        MapPolyline(coordinates: viewModel.gpsTrailCoordinates)
+                            .stroke(Color(red: 0.13, green: 0.56, blue: 0.95), lineWidth: 4)
+                    }
+
+                    if viewModel.inertialTrailCoordinates.count >= 2 {
+                        MapPolyline(coordinates: viewModel.inertialTrailCoordinates)
+                            .stroke(Color(red: 0.97, green: 0.45, blue: 0.15), style: StrokeStyle(lineWidth: 4, lineCap: .round, lineJoin: .round))
+                    }
+                }
+
                 ForEach(viewModel.annotations) { annotation in
                     Annotation(annotation.title, coordinate: annotation.coordinate, anchor: .bottom) {
                         AnnotationBadge(annotation: annotation)
@@ -103,6 +115,32 @@ struct ContentView: View {
                     Text(viewModel.referenceFrameText)
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.secondary)
+                }
+
+                HStack(spacing: 10) {
+                    Button(action: viewModel.showTrails) {
+                        Label("Show Trails", systemImage: "scribble")
+                            .font(.caption.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                    }
+                    .buttonStyle(TrailActionButtonStyle())
+
+                    Button(action: viewModel.hideTrails) {
+                        Label("Hide Trails", systemImage: "eye.slash")
+                            .font(.caption.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                    }
+                    .buttonStyle(TrailActionButtonStyle())
+
+                    Button(action: viewModel.clearTrails) {
+                        Label("Clear Trails", systemImage: "trash")
+                            .font(.caption.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                    }
+                    .buttonStyle(TrailActionButtonStyle())
                 }
 
                 Button(action: viewModel.snapToGPS) {
@@ -205,6 +243,18 @@ private struct StatCard: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(14)
         .background(accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+}
+
+private struct TrailActionButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundStyle(.primary)
+            .background(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(Color.white.opacity(configuration.isPressed ? 0.35 : 0.55))
+            )
+            .scaleEffect(configuration.isPressed ? 0.98 : 1)
     }
 }
 

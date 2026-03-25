@@ -68,6 +68,9 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
     @Published private(set) var statusText = "Requesting location permission..."
     @Published private(set) var referenceFrameText = "Sensors idle"
     @Published private(set) var movementMode: MovementMode = .walking
+    @Published private(set) var gpsTrailCoordinates: [CLLocationCoordinate2D] = []
+    @Published private(set) var inertialTrailCoordinates: [CLLocationCoordinate2D] = []
+    @Published private(set) var areTrailsVisible = true
     @Published private(set) var gpsSpeedMPH = 0.0
     @Published private(set) var inertialSpeedMPH = 0.0
     @Published private(set) var headingDegrees = 0.0
@@ -116,6 +119,8 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
     private let drivingRoadMatchProjectionDistance = 45.0
     private let walkingRoadMatchProjectionDistance = 18.0
     private let walkingRoadSeedMaximumDistanceFromGPS = 15.0
+    private let trailMinimumSegmentDistance = 1.5
+    private let maximumTrailPointCount = 3_000
 
     private var hasStarted = false
     private var lastLocation: CLLocation?
@@ -168,16 +173,38 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         shouldAutoCenterMap = false
     }
 
+    func showTrails() {
+        areTrailsVisible = true
+    }
+
+    func hideTrails() {
+        areTrailsVisible = false
+    }
+
+    func clearTrails() {
+        gpsTrailCoordinates.removeAll()
+        inertialTrailCoordinates.removeAll()
+
+        if let lastLocation {
+            appendTrailCoordinate(lastLocation.coordinate, to: &gpsTrailCoordinates)
+        }
+        if let inertialCoordinate = annotations.first(where: { $0.id == "inertial" })?.coordinate {
+            appendTrailCoordinate(inertialCoordinate, to: &inertialTrailCoordinates)
+        }
+    }
+
     func setMovementMode(_ mode: MovementMode) {
         guard movementMode != mode else { return }
 
         movementMode = mode
 
         if mode == .driving {
-            roadMatchState?.isLocked = true
-            statusText = "Driving mode keeps the inertial marker constrained to roads."
+            statusText = "Driving mode can lock to roads when the fit looks reliable."
         } else {
-            statusText = "Walking mode prefers roads when they remain the best fit."
+            roadMatchTask?.cancel()
+            roadMatchTask = nil
+            roadMatchState = nil
+            statusText = "Walking mode leaves the inertial marker free-moving."
         }
 
         if let rawInertialCoordinate {
@@ -195,6 +222,7 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
 
         lastLocation = location
         gpsSpeedMPH = max(location.speed, 0) * 2.2369362920544
+        appendTrailCoordinate(location.coordinate, to: &gpsTrailCoordinates)
 
         if inertialOrigin == nil {
             seedInertialState(from: location, resetMotionClock: true)
@@ -354,6 +382,13 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
                 coordinate: location.coordinate
             )
         ]
+
+        if gpsTrailCoordinates.isEmpty {
+            appendTrailCoordinate(location.coordinate, to: &gpsTrailCoordinates)
+        }
+        if inertialTrailCoordinates.isEmpty {
+            appendTrailCoordinate(location.coordinate, to: &inertialTrailCoordinates)
+        }
     }
 
     private func updateAnnotations() {
@@ -396,35 +431,31 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
             )
         )
         annotations = nextAnnotations.sorted { $0.id < $1.id }
+        appendTrailCoordinate(coordinate, to: &inertialTrailCoordinates)
     }
 
     private func updateRoadMatchedCoordinate(using rawCoordinate: CLLocationCoordinate2D) {
+        guard movementMode == .driving else {
+            replaceInertialAnnotation(with: rawCoordinate)
+            return
+        }
+
         let speedMetersPerSecond = simd_length(inertialVelocityMetersPerSecond)
         let heading = courseDegrees(from: inertialVelocityMetersPerSecond)
         let snap = snapToCurrentRoute(rawCoordinate: rawCoordinate)
-        let shouldStayRoadLocked = movementMode == .driving || (roadMatchState?.isLocked == true)
+        let shouldStayRoadLocked = roadMatchState?.isLocked == true
 
         guard speedMetersPerSecond >= activeRoadMatchMinimumSpeed || shouldStayRoadLocked else {
             replaceInertialAnnotation(with: rawCoordinate)
             return
         }
 
-        switch movementMode {
-        case .driving:
-            applyDrivingRoadBehavior(
-                rawCoordinate: rawCoordinate,
-                heading: heading,
-                speedMetersPerSecond: speedMetersPerSecond,
-                snap: snap
-            )
-        case .walking:
-            applyWalkingRoadBehavior(
-                rawCoordinate: rawCoordinate,
-                heading: heading,
-                speedMetersPerSecond: speedMetersPerSecond,
-                snap: snap
-            )
-        }
+        applyDrivingRoadBehavior(
+            rawCoordinate: rawCoordinate,
+            heading: heading,
+            speedMetersPerSecond: speedMetersPerSecond,
+            snap: snap
+        )
     }
 
     private func applyDrivingRoadBehavior(
@@ -439,41 +470,10 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
             roadMatchState?.consecutiveMisses = 0
             roadMatchState?.isLocked = true
             replaceInertialAnnotation(with: snap.coordinate)
-        } else if let roadMatchState {
-            self.roadMatchState?.consecutiveMisses = roadMatchState.consecutiveMisses + 1
-            replaceInertialAnnotation(with: roadMatchState.lastSnappedCoordinate)
-        } else {
-            replaceInertialAnnotation(with: lastLocation?.coordinate ?? rawCoordinate)
-        }
-
-        let hasMissedTooLong = (roadMatchState?.consecutiveMisses ?? 0) >= roadMissToleranceDriving
-        let shouldForceRawStart = hasMissedTooLong || shouldForceRouteRefresh(rawCoordinate: rawCoordinate, tolerance: roadMissDistanceDriving)
-        if shouldForceRawStart || shouldRefreshRoadMatch(for: rawCoordinate, heading: heading) {
-            refreshRoadMatch(
-                from: rawCoordinate,
-                heading: heading,
-                speedMetersPerSecond: speedMetersPerSecond,
-                preferRawStart: shouldForceRawStart || roadMatchState == nil
-            )
-        }
-    }
-
-    private func applyWalkingRoadBehavior(
-        rawCoordinate: CLLocationCoordinate2D,
-        heading: Double,
-        speedMetersPerSecond: Double,
-        snap: (coordinate: CLLocationCoordinate2D, progressDistance: Double, distanceFromRaw: Double)?
-    ) {
-        if let snap, snap.distanceFromRaw <= roadMissDistanceWalking {
-            roadMatchState?.lastSnappedCoordinate = snap.coordinate
-            roadMatchState?.lastProgressDistance = snap.progressDistance
-            roadMatchState?.consecutiveMisses = 0
-            roadMatchState?.isLocked = true
-            replaceInertialAnnotation(with: snap.coordinate)
         } else if let roadMatchState, roadMatchState.isLocked {
             self.roadMatchState?.consecutiveMisses = roadMatchState.consecutiveMisses + 1
 
-            if shouldReleaseWalkingLock(rawCoordinate: rawCoordinate) {
+            if shouldReleaseDrivingLock(rawCoordinate: rawCoordinate) {
                 self.roadMatchState?.isLocked = false
                 self.roadMatchState?.consecutiveMisses = 0
                 replaceInertialAnnotation(with: rawCoordinate)
@@ -484,17 +484,13 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
             replaceInertialAnnotation(with: rawCoordinate)
         }
 
-        guard canAttemptWalkingRoadRefresh(rawCoordinate: rawCoordinate) else {
-            return
-        }
-
-        let shouldForceRawStart = shouldForceRouteRefresh(rawCoordinate: rawCoordinate, tolerance: roadMissDistanceWalking)
+        let shouldForceRawStart = shouldForceRouteRefresh(rawCoordinate: rawCoordinate, tolerance: roadMissDistanceDriving)
         if shouldForceRawStart || shouldRefreshRoadMatch(for: rawCoordinate, heading: heading) {
             refreshRoadMatch(
                 from: rawCoordinate,
                 heading: heading,
                 speedMetersPerSecond: speedMetersPerSecond,
-                preferRawStart: shouldForceRawStart
+                preferRawStart: shouldForceRawStart || roadMatchState == nil
             )
         }
     }
@@ -525,7 +521,7 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         return rawLocation.distance(from: snappedLocation) > tolerance
     }
 
-    private func shouldReleaseWalkingLock(rawCoordinate: CLLocationCoordinate2D) -> Bool {
+    private func shouldReleaseDrivingLock(rawCoordinate: CLLocationCoordinate2D) -> Bool {
         guard let roadMatchState else { return false }
 
         let rawLocation = CLLocation(latitude: rawCoordinate.latitude, longitude: rawCoordinate.longitude)
@@ -534,8 +530,8 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
             longitude: roadMatchState.lastSnappedCoordinate.longitude
         )
 
-        return roadMatchState.consecutiveMisses >= roadMissToleranceWalking &&
-            rawLocation.distance(from: snappedLocation) > roadMissDistanceWalking
+        return roadMatchState.consecutiveMisses >= roadMissToleranceDriving &&
+            rawLocation.distance(from: snappedLocation) > roadMissDistanceDriving
     }
 
     private func refreshRoadMatch(
@@ -574,7 +570,7 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
                     lastRefreshHeading: heading,
                     lastRefreshDate: Date(),
                     consecutiveMisses: 0,
-                    isLocked: self.movementMode == .driving || wasLocked
+                    isLocked: wasLocked
                 )
 
                 if let rawInertialCoordinate = self.rawInertialCoordinate,
@@ -586,7 +582,7 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
                     nextRoadMatchState.lastSnappedCoordinate = match.coordinate
                     nextRoadMatchState.lastProgressDistance = match.progressDistance
                     nextRoadMatchState.consecutiveMisses = 0
-                    nextRoadMatchState.isLocked = self.movementMode == .driving || wasLocked
+                    nextRoadMatchState.isLocked = true
                     self.roadMatchState = nextRoadMatchState
                     self.replaceInertialAnnotation(with: match.coordinate)
                     self.updateRegion()
@@ -805,34 +801,19 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
     }
 
     private var activeRoadMatchMinimumSpeed: Double {
-        movementMode == .driving ? drivingRoadMatchMinimumSpeed : walkingRoadMatchMinimumSpeed
+        drivingRoadMatchMinimumSpeed
     }
 
     private var activeRoadMatchRefreshHeadingDelta: Double {
-        movementMode == .driving ? drivingRoadMatchRefreshHeadingDelta : walkingRoadMatchRefreshHeadingDelta
+        drivingRoadMatchRefreshHeadingDelta
     }
 
     private var activeRoadMatchRefreshInterval: TimeInterval {
-        movementMode == .driving ? drivingRoadMatchRefreshInterval : walkingRoadMatchRefreshInterval
+        drivingRoadMatchRefreshInterval
     }
 
     private var activeRoadMatchProjectionDistance: Double {
-        movementMode == .driving ? drivingRoadMatchProjectionDistance : walkingRoadMatchProjectionDistance
-    }
-
-    private func canAttemptWalkingRoadRefresh(rawCoordinate: CLLocationCoordinate2D) -> Bool {
-        if roadMatchState?.isLocked == true {
-            return true
-        }
-
-        guard let lastLocation else { return false }
-
-        let rawLocation = CLLocation(latitude: rawCoordinate.latitude, longitude: rawCoordinate.longitude)
-        let gpsLocation = CLLocation(latitude: lastLocation.coordinate.latitude, longitude: lastLocation.coordinate.longitude)
-        let distanceFromGPS = rawLocation.distance(from: gpsLocation)
-
-        return distanceFromGPS <= walkingRoadSeedMaximumDistanceFromGPS &&
-            max(lastLocation.speed, 0) >= 0.4
+        drivingRoadMatchProjectionDistance
     }
 
     private func normalizedDeltaDegrees(_ lhs: Double, _ rhs: Double) -> Double {
@@ -845,6 +826,21 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         let longitudeScale = max(cos(center.latitude * .pi / 180), 0.01)
         let longitudeDelta = max(latitudeDelta / longitudeScale, 0.002)
         return MKCoordinateSpan(latitudeDelta: latitudeDelta, longitudeDelta: longitudeDelta)
+    }
+
+    private func appendTrailCoordinate(_ coordinate: CLLocationCoordinate2D, to trail: inout [CLLocationCoordinate2D]) {
+        if let lastCoordinate = trail.last {
+            let lastLocation = CLLocation(latitude: lastCoordinate.latitude, longitude: lastCoordinate.longitude)
+            let newLocation = CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude)
+            guard newLocation.distance(from: lastLocation) >= trailMinimumSegmentDistance else {
+                return
+            }
+        }
+
+        trail.append(coordinate)
+        if trail.count > maximumTrailPointCount {
+            trail.removeFirst(trail.count - maximumTrailPointCount)
+        }
     }
 }
 
