@@ -71,6 +71,7 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
     @Published private(set) var gpsTrailCoordinates: [CLLocationCoordinate2D] = []
     @Published private(set) var inertialTrailCoordinates: [CLLocationCoordinate2D] = []
     @Published private(set) var areTrailsVisible = true
+    @Published private(set) var isPlacingInertialPin = false
     @Published private(set) var gpsSpeedMPH = 0.0
     @Published private(set) var inertialSpeedMPH = 0.0
     @Published private(set) var headingDegrees = 0.0
@@ -191,6 +192,40 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         if let inertialCoordinate = annotations.first(where: { $0.id == "inertial" })?.coordinate {
             appendTrailCoordinate(inertialCoordinate, to: &inertialTrailCoordinates)
         }
+    }
+
+    func resetInertialSpeed() {
+        inertialVelocityMetersPerSecond = .zero
+        lastMotionTimestamp = nil
+        updateDerivedReadouts()
+        statusText = "Inertial speed reset to 0."
+    }
+
+    func startPlacingInertialPin() {
+        isPlacingInertialPin = true
+        statusText = "Tap the map to move the inertial marker."
+    }
+
+    func cancelPlacingInertialPin() {
+        isPlacingInertialPin = false
+        statusText = "Pin placement cancelled."
+    }
+
+    func placeInertialMarker(at coordinate: CLLocationCoordinate2D) {
+        isPlacingInertialPin = false
+        inertialOrigin = coordinate
+        rawInertialCoordinate = coordinate
+        inertialOffsetMeters = .zero
+        inertialVelocityMetersPerSecond = .zero
+        lastMotionTimestamp = nil
+        roadMatchTask?.cancel()
+        roadMatchTask = nil
+        roadMatchState = nil
+        inertialTrailCoordinates = [coordinate]
+        replaceInertialAnnotation(with: coordinate)
+        updateDerivedReadouts()
+        updateRegion()
+        statusText = "Inertial marker moved to the selected pin."
     }
 
     func setMovementMode(_ mode: MovementMode) {

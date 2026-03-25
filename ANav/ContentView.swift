@@ -13,41 +13,67 @@ struct ContentView: View {
     @State private var isPanelMinimized = false
     @State private var panelHeight: CGFloat = 0
     @GestureState private var panelDragTranslation: CGFloat = 0
+    @State private var selectedPanelPage = 0
 
     var body: some View {
         ZStack(alignment: .bottom) {
-            Map(position: $viewModel.cameraPosition) {
-                if viewModel.areTrailsVisible {
-                    if viewModel.gpsTrailCoordinates.count >= 2 {
-                        MapPolyline(coordinates: viewModel.gpsTrailCoordinates)
-                            .stroke(Color(red: 0.13, green: 0.56, blue: 0.95), lineWidth: 4)
+            MapReader { proxy in
+                Map(position: $viewModel.cameraPosition) {
+                    if viewModel.areTrailsVisible {
+                        if viewModel.gpsTrailCoordinates.count >= 2 {
+                            MapPolyline(coordinates: viewModel.gpsTrailCoordinates)
+                                .stroke(Color(red: 0.13, green: 0.56, blue: 0.95), lineWidth: 4)
+                        }
+
+                        if viewModel.inertialTrailCoordinates.count >= 2 {
+                            MapPolyline(coordinates: viewModel.inertialTrailCoordinates)
+                                .stroke(Color(red: 0.97, green: 0.45, blue: 0.15), style: StrokeStyle(lineWidth: 4, lineCap: .round, lineJoin: .round))
+                        }
                     }
 
-                    if viewModel.inertialTrailCoordinates.count >= 2 {
-                        MapPolyline(coordinates: viewModel.inertialTrailCoordinates)
-                            .stroke(Color(red: 0.97, green: 0.45, blue: 0.15), style: StrokeStyle(lineWidth: 4, lineCap: .round, lineJoin: .round))
+                    ForEach(viewModel.annotations) { annotation in
+                        Annotation(annotation.title, coordinate: annotation.coordinate, anchor: .bottom) {
+                            AnnotationBadge(annotation: annotation)
+                        }
                     }
                 }
+                .overlay {
+                    if viewModel.isPlacingInertialPin {
+                        ZStack(alignment: .top) {
+                            Color.clear
+                                .contentShape(Rectangle())
+                                .gesture(
+                                    SpatialTapGesture()
+                                        .onEnded { value in
+                                            if let coordinate = proxy.convert(value.location, from: .local) {
+                                                viewModel.placeInertialMarker(at: coordinate)
+                                            }
+                                        }
+                                )
 
-                ForEach(viewModel.annotations) { annotation in
-                    Annotation(annotation.title, coordinate: annotation.coordinate, anchor: .bottom) {
-                        AnnotationBadge(annotation: annotation)
+                            Text("Tap the map to place the inertial marker")
+                                .font(.footnote.weight(.semibold))
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 10)
+                                .background(.ultraThinMaterial, in: Capsule())
+                                .padding(.top, 72)
+                        }
                     }
                 }
+                .simultaneousGesture(
+                    DragGesture(minimumDistance: 1)
+                        .onChanged { _ in
+                            viewModel.handleMapInteraction()
+                        }
+                )
+                .simultaneousGesture(
+                    MagnifyGesture()
+                        .onChanged { _ in
+                            viewModel.handleMapInteraction()
+                        }
+                )
+                .ignoresSafeArea()
             }
-            .simultaneousGesture(
-                DragGesture(minimumDistance: 1)
-                    .onChanged { _ in
-                        viewModel.handleMapInteraction()
-                    }
-            )
-            .simultaneousGesture(
-                MagnifyGesture()
-                    .onChanged { _ in
-                        viewModel.handleMapInteraction()
-                    }
-            )
-            .ignoresSafeArea()
 
             VStack(spacing: 14) {
                 Capsule()
@@ -60,110 +86,141 @@ struct ContentView: View {
                         }
                     }
 
-                HStack(spacing: 10) {
-                    ForEach(MovementMode.allCases) { mode in
-                        Button(action: { viewModel.setMovementMode(mode) }) {
-                            Label(mode.title, systemImage: mode.systemImage)
-                                .font(.caption.weight(.semibold))
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 10)
-                                .foregroundStyle(viewModel.movementMode == mode ? .white : .primary)
-                                .background(
-                                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                        .fill(
-                                            viewModel.movementMode == mode
-                                                ? Color(red: 0.15, green: 0.22, blue: 0.34)
-                                                : Color.white.opacity(0.55)
+                TabView(selection: $selectedPanelPage) {
+                    VStack(spacing: 14) {
+                        HStack(spacing: 10) {
+                            ForEach(MovementMode.allCases) { mode in
+                                Button(action: { viewModel.setMovementMode(mode) }) {
+                                    Label(mode.title, systemImage: mode.systemImage)
+                                        .font(.caption2.weight(.semibold))
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 9)
+                                        .lineLimit(1)
+                                        .minimumScaleFactor(0.75)
+                                        .foregroundStyle(viewModel.movementMode == mode ? .white : .primary)
+                                        .background(
+                                            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                                .fill(
+                                                    viewModel.movementMode == mode
+                                                        ? Color(red: 0.15, green: 0.22, blue: 0.34)
+                                                        : Color.white.opacity(0.55)
+                                                )
                                         )
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+
+                        HStack(spacing: 12) {
+                            StatCard(
+                                title: "GPS Speed",
+                                value: viewModel.gpsSpeedText,
+                                accent: Color(red: 0.13, green: 0.56, blue: 0.95)
+                            )
+                            StatCard(
+                                title: "Inertial Speed",
+                                value: viewModel.inertialSpeedText,
+                                accent: Color(red: 0.97, green: 0.45, blue: 0.15)
+                            )
+                        }
+
+                        HStack(spacing: 12) {
+                            StatCard(
+                                title: "Heading",
+                                value: viewModel.headingText,
+                                accent: Color(red: 0.46, green: 0.35, blue: 0.85)
+                            )
+                            Spacer(minLength: 0)
+                        }
+
+                        Button(action: viewModel.snapToGPS) {
+                            Label("Snap To GPS", systemImage: "location.circle.fill")
+                                .font(.headline.weight(.semibold))
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 14)
+                                .foregroundStyle(.white)
+                                .background(
+                                    LinearGradient(
+                                        colors: [
+                                            Color(red: 0.96, green: 0.53, blue: 0.18),
+                                            Color(red: 0.83, green: 0.31, blue: 0.09)
+                                        ],
+                                        startPoint: .leading,
+                                        endPoint: .trailing
+                                    ),
+                                    in: RoundedRectangle(cornerRadius: 18, style: .continuous)
                                 )
                         }
                         .buttonStyle(.plain)
+                        .disabled(!viewModel.canSnapToGPS)
+                        .opacity(viewModel.canSnapToGPS ? 1 : 0.55)
+                    }
+                    .tag(0)
+                    .padding(.horizontal, 2)
+
+                    VStack(spacing: 14) {
+                        Text("Inertial Settings")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.secondary)
+
+                        HStack(spacing: 10) {
+                            InertialActionButton(action: viewModel.resetInertialSpeed) {
+                                Label("Reset Inertial", systemImage: "arrow.counterclockwise")
+                                    .font(.caption.weight(.semibold))
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 10)
+                            }
+
+                            InertialActionButton(action: {
+                                if viewModel.isPlacingInertialPin {
+                                    viewModel.cancelPlacingInertialPin()
+                                } else {
+                                    viewModel.startPlacingInertialPin()
+                                }
+                            }) {
+                                Label(viewModel.isPlacingInertialPin ? "Cancel Pin" : "Place Pin", systemImage: viewModel.isPlacingInertialPin ? "xmark.circle" : "mappin.and.ellipse")
+                                    .font(.caption.weight(.semibold))
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 10)
+                            }
+                        }
+
+                        HStack(spacing: 10) {
+                            InertialActionButton(action: viewModel.showTrails) {
+                                Label("Show Trails", systemImage: "scribble")
+                                    .font(.caption.weight(.semibold))
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 10)
+                            }
+
+                            InertialActionButton(action: viewModel.hideTrails) {
+                                Label("Hide Trails", systemImage: "eye.slash")
+                                    .font(.caption.weight(.semibold))
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 10)
+                            }
+                        }
+
+                        InertialActionButton(action: viewModel.clearTrails) {
+                            Label("Clear Trails", systemImage: "trash")
+                                .font(.caption.weight(.semibold))
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 10)
+                        }
+                    }
+                    .tag(1)
+                    .padding(.horizontal, 2)
+                }
+                .tabViewStyle(.page(indexDisplayMode: .never))
+                .frame(height: 292)
+
+                HStack(spacing: 8) {
+                    ForEach(0..<2, id: \.self) { page in
+                        Circle()
+                            .fill(selectedPanelPage == page ? Color.primary : Color.secondary.opacity(0.35))
+                            .frame(width: 7, height: 7)
                     }
                 }
-
-                HStack(spacing: 12) {
-                    StatCard(
-                        title: "GPS Speed",
-                        value: viewModel.gpsSpeedText,
-                        accent: Color(red: 0.13, green: 0.56, blue: 0.95)
-                    )
-                    StatCard(
-                        title: "Inertial Speed",
-                        value: viewModel.inertialSpeedText,
-                        accent: Color(red: 0.97, green: 0.45, blue: 0.15)
-                    )
-                }
-
-                HStack(spacing: 12) {
-                    StatCard(
-                        title: "Heading",
-                        value: viewModel.headingText,
-                        accent: Color(red: 0.46, green: 0.35, blue: 0.85)
-                    )
-                    Spacer(minLength: 0)
-                }
-
-                HStack(spacing: 18) {
-                    LegendItem(label: "GPS", color: Color(red: 0.13, green: 0.56, blue: 0.95))
-                    LegendItem(label: "Inertial", color: Color(red: 0.97, green: 0.45, blue: 0.15))
-                    Spacer()
-                    Button(action: viewModel.recenterMap) {
-                        Label("Recenter", systemImage: "scope")
-                            .font(.caption.weight(.semibold))
-                    }
-                    .buttonStyle(.plain)
-                    Text(viewModel.referenceFrameText)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                }
-
-                HStack(spacing: 10) {
-                    Button(action: viewModel.showTrails) {
-                        Label("Show Trails", systemImage: "scribble")
-                            .font(.caption.weight(.semibold))
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 10)
-                    }
-                    .buttonStyle(TrailActionButtonStyle())
-
-                    Button(action: viewModel.hideTrails) {
-                        Label("Hide Trails", systemImage: "eye.slash")
-                            .font(.caption.weight(.semibold))
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 10)
-                    }
-                    .buttonStyle(TrailActionButtonStyle())
-
-                    Button(action: viewModel.clearTrails) {
-                        Label("Clear Trails", systemImage: "trash")
-                            .font(.caption.weight(.semibold))
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 10)
-                    }
-                    .buttonStyle(TrailActionButtonStyle())
-                }
-
-                Button(action: viewModel.snapToGPS) {
-                    Label("Snap To GPS", systemImage: "location.circle.fill")
-                        .font(.headline.weight(.semibold))
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 14)
-                        .foregroundStyle(.white)
-                        .background(
-                            LinearGradient(
-                                colors: [
-                                    Color(red: 0.96, green: 0.53, blue: 0.18),
-                                    Color(red: 0.83, green: 0.31, blue: 0.09)
-                                ],
-                                startPoint: .leading,
-                                endPoint: .trailing
-                            ),
-                            in: RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        )
-                }
-                .buttonStyle(.plain)
-                .disabled(!viewModel.canSnapToGPS)
-                .opacity(viewModel.canSnapToGPS ? 1 : 0.55)
             }
             .padding(16)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
@@ -247,14 +304,66 @@ private struct StatCard: View {
 }
 
 private struct TrailActionButtonStyle: ButtonStyle {
+    var isFlashed = false
+
     func makeBody(configuration: Configuration) -> some View {
+        let isActive = configuration.isPressed || isFlashed
+
         configuration.label
             .foregroundStyle(.primary)
             .background(
                 RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(Color.white.opacity(configuration.isPressed ? 0.35 : 0.55))
+                    .fill(
+                        isActive
+                            ? Color(red: 0.92, green: 0.84, blue: 0.72)
+                            : Color.white.opacity(0.55)
+                    )
             )
-            .scaleEffect(configuration.isPressed ? 0.98 : 1)
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .strokeBorder(
+                        isActive
+                            ? Color(red: 0.79, green: 0.48, blue: 0.16)
+                            : Color.white.opacity(0.4),
+                        lineWidth: isActive ? 1.5 : 1
+                    )
+            )
+            .shadow(
+                color: .black.opacity(isActive ? 0.06 : 0.14),
+                radius: isActive ? 2 : 8,
+                y: isActive ? 1 : 4
+            )
+            .scaleEffect(isActive ? 0.93 : 1)
+            .offset(y: isActive ? 1 : 0)
+            .animation(.spring(response: 0.18, dampingFraction: 0.72), value: isActive)
+    }
+}
+
+private struct InertialActionButton<Label: View>: View {
+    let action: () -> Void
+    @ViewBuilder let label: () -> Label
+
+    @State private var isFlashing = false
+
+    var body: some View {
+        Button(action: triggerAction) {
+            label()
+        }
+        .buttonStyle(TrailActionButtonStyle(isFlashed: isFlashing))
+    }
+
+    private func triggerAction() {
+        withAnimation(.spring(response: 0.18, dampingFraction: 0.72)) {
+            isFlashing = true
+        }
+
+        action()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.16) {
+            withAnimation(.spring(response: 0.22, dampingFraction: 0.78)) {
+                isFlashing = false
+            }
+        }
     }
 }
 
