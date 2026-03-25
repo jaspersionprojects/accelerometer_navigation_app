@@ -44,13 +44,22 @@ struct ContentView: View {
 
                 HStack(spacing: 10) {
                     ForEach(MovementMode.allCases) { mode in
-                        ModeButton(
-                            mode: mode,
-                            isSelected: viewModel.movementMode == mode,
-                            action: {
-                                viewModel.setMovementMode(mode)
-                            }
-                        )
+                        Button(action: { viewModel.setMovementMode(mode) }) {
+                            Label(mode.title, systemImage: mode.systemImage)
+                                .font(.caption.weight(.semibold))
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 10)
+                                .foregroundStyle(viewModel.movementMode == mode ? .white : .primary)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                        .fill(
+                                            viewModel.movementMode == mode
+                                                ? Color(red: 0.15, green: 0.22, blue: 0.34)
+                                                : Color.white.opacity(0.55)
+                                        )
+                                )
+                        }
+                        .buttonStyle(.plain)
                     }
                 }
 
@@ -122,36 +131,6 @@ struct ContentView: View {
             .padding(.bottom, 20)
         }
         .onAppear(perform: viewModel.start)
-    }
-}
-
-private struct ModeButton: View {
-    let mode: MovementMode
-    let isSelected: Bool
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            Label(mode.title, systemImage: mode.systemImage)
-                .font(.subheadline.weight(.semibold))
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 12)
-                .foregroundStyle(isSelected ? .white : .primary)
-                .background(
-                    isSelected ? AnyShapeStyle(
-                        LinearGradient(
-                            colors: [
-                                Color(red: 0.10, green: 0.45, blue: 0.88),
-                                Color(red: 0.05, green: 0.26, blue: 0.60)
-                            ],
-                            startPoint: .leading,
-                            endPoint: .trailing
-                        )
-                    ) : AnyShapeStyle(Color.black.opacity(0.06)),
-                    in: RoundedRectangle(cornerRadius: 16, style: .continuous)
-                )
-        }
-        .buttonStyle(.plain)
     }
 }
 
