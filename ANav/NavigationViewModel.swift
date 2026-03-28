@@ -116,6 +116,10 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
     private let earthRadiusMeters = 6_378_137.0
     private let gravityMetersPerSecondSquared = 9.80665
     private let accelerationDeadband = 0.05
+    private let stationaryAccelerationThreshold = 0.045
+    private let stationaryRotationRateThreshold = 0.08
+    private let stationaryHeadingDeltaThreshold = 6.0
+    private let stationarySampleThreshold = 5
     private let stoppedSpeedThreshold = 0.35
     private let roadMatchRefreshDistance = 12.0
     private let roadSnapMaximumDistance = 25.0
@@ -145,6 +149,8 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
     private var inertialVelocityMetersPerSecond = SIMD2<Double>(repeating: 0)
     private var lastMotionTimestamp: TimeInterval?
     private var motionHeadingDegrees: Double?
+    private var stationarySampleCount = 0
+    private var stationaryHeadingReference: Double?
     private var shouldAutoCenterMap = true
     private var roadMatchState: RoadMatchState?
     private var roadMatchTask: Task<Void, Never>?
@@ -245,6 +251,7 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         inertialOffsetMeters = .zero
         inertialVelocityMetersPerSecond = .zero
         lastMotionTimestamp = nil
+        resetStationaryDetectionState()
         roadMatchTask?.cancel()
         roadMatchTask = nil
         roadMatchState = nil
@@ -371,12 +378,14 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
 
         guard let inertialOrigin else {
             lastMotionTimestamp = motion.timestamp
+            resetStationaryDetectionState()
             updateDerivedReadouts()
             return
         }
 
         guard let lastMotionTimestamp else {
             self.lastMotionTimestamp = motion.timestamp
+            resetStationaryDetectionState()
             updateDerivedReadouts()
             return
         }
@@ -389,8 +398,7 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         inertialOffsetMeters += inertialVelocityMetersPerSecond * deltaTime + 0.5 * horizontalAcceleration * deltaTime * deltaTime
         inertialVelocityMetersPerSecond += horizontalAcceleration * deltaTime
 
-        if simd_length(horizontalAcceleration) < accelerationDeadband,
-           simd_length(inertialVelocityMetersPerSecond) < stoppedSpeedThreshold {
+        if updateStationaryDetection(with: motion, horizontalAcceleration: horizontalAcceleration) {
             inertialVelocityMetersPerSecond = .zero
         }
 
@@ -406,10 +414,80 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         updateRegion()
     }
 
+    private func updateStationaryDetection(
+        with motion: CMDeviceMotion,
+        horizontalAcceleration: SIMD2<Double>
+    ) -> Bool {
+        let accelerationMagnitude = simd_length(horizontalAcceleration)
+        let rotationRate = motion.rotationRate
+        let rotationMagnitude = sqrt(
+            rotationRate.x * rotationRate.x +
+            rotationRate.y * rotationRate.y +
+            rotationRate.z * rotationRate.z
+        )
+
+        let currentHeading = currentHeadingForStationaryDetection(from: motion)
+        let headingIsStable: Bool
+
+        if let currentHeading {
+            if let stationaryHeadingReference {
+                headingIsStable = abs(normalizedDeltaDegrees(currentHeading, stationaryHeadingReference)) <= stationaryHeadingDeltaThreshold
+            } else {
+                headingIsStable = true
+            }
+        } else {
+            headingIsStable = true
+        }
+
+        let isCandidateStationary =
+            accelerationMagnitude <= stationaryAccelerationThreshold &&
+            rotationMagnitude <= stationaryRotationRateThreshold &&
+            headingIsStable
+
+        if isCandidateStationary {
+            stationarySampleCount += 1
+            if let currentHeading {
+                if let existingStationaryHeadingReference = stationaryHeadingReference {
+                    let delta = normalizedDeltaDegrees(currentHeading, existingStationaryHeadingReference)
+                    stationaryHeadingReference = normalize(angle: existingStationaryHeadingReference + delta * 0.25)
+                } else {
+                    stationaryHeadingReference = currentHeading
+                }
+            }
+        } else {
+            stationarySampleCount = 0
+            stationaryHeadingReference = currentHeading
+        }
+
+        return stationarySampleCount >= stationarySampleThreshold
+    }
+
+    private func currentHeadingForStationaryDetection(from motion: CMDeviceMotion) -> Double? {
+        if motion.heading >= 0 {
+            return normalize(angle: motion.heading)
+        }
+
+        if let motionHeadingDegrees {
+            return motionHeadingDegrees
+        }
+
+        if let lastLocation, lastLocation.course >= 0 {
+            return normalize(angle: lastLocation.course)
+        }
+
+        return nil
+    }
+
+    private func resetStationaryDetectionState() {
+        stationarySampleCount = 0
+        stationaryHeadingReference = nil
+    }
+
     private func seedInertialState(from location: CLLocation, resetMotionClock: Bool) {
         inertialOrigin = location.coordinate
         rawInertialCoordinate = location.coordinate
         inertialOffsetMeters = .zero
+        resetStationaryDetectionState()
         roadMatchState = nil
         roadMatchTask?.cancel()
         roadMatchTask = nil
