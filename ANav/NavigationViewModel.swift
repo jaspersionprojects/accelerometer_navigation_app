@@ -88,6 +88,18 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         String(format: "%.0f°", headingDegrees)
     }
 
+    var markerSeparationText: String {
+        guard let separationMeters = markerSeparationMeters else {
+            return "-- m"
+        }
+
+        if separationMeters >= 10 {
+            return String(format: "%.0f m", separationMeters)
+        } else {
+            return String(format: "%.1f m", separationMeters)
+        }
+    }
+
     var canSnapToGPS: Bool {
         lastLocation != nil
     }
@@ -136,6 +148,19 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
     private var shouldAutoCenterMap = true
     private var roadMatchState: RoadMatchState?
     private var roadMatchTask: Task<Void, Never>?
+
+    private var markerSeparationMeters: Double? {
+        guard
+            let gpsCoordinate = annotations.first(where: { $0.id == "gps" })?.coordinate,
+            let inertialCoordinate = annotations.first(where: { $0.id == "inertial" })?.coordinate
+        else {
+            return nil
+        }
+
+        let gpsLocation = CLLocation(latitude: gpsCoordinate.latitude, longitude: gpsCoordinate.longitude)
+        let inertialLocation = CLLocation(latitude: inertialCoordinate.latitude, longitude: inertialCoordinate.longitude)
+        return gpsLocation.distance(from: inertialLocation)
+    }
 
     func start() {
         guard !hasStarted else { return }
@@ -939,8 +964,11 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         let referenceX = rotation.m11 * acceleration.x + rotation.m21 * acceleration.y + rotation.m31 * acceleration.z
         let referenceY = rotation.m12 * acceleration.x + rotation.m22 * acceleration.y + rotation.m32 * acceleration.z
 
+        // In the north-aligned Core Motion reference frames, X points north and Y is the
+        // horizontal east/west axis paired with gravity-aligned Z. Mapping Y directly to
+        // east avoids mirroring left/right turns on the map.
         var eastNorthAcceleration = SIMD2<Double>(
-            -referenceY * gravityMetersPerSecondSquared,
+            referenceY * gravityMetersPerSecondSquared,
             referenceX * gravityMetersPerSecondSquared
         )
 

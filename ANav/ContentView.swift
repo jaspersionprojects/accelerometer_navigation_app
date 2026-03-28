@@ -130,7 +130,11 @@ struct ContentView: View {
                                 value: viewModel.headingText,
                                 accent: Color(red: 0.46, green: 0.35, blue: 0.85)
                             )
-                            Spacer(minLength: 0)
+                            StatCard(
+                                title: "GPS Gap",
+                                value: viewModel.markerSeparationText,
+                                accent: Color(red: 0.16, green: 0.67, blue: 0.54)
+                            )
                         }
 
                         Button(action: viewModel.snapToGPS) {
