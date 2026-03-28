@@ -126,6 +126,7 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
     private let stationaryRotationRateThreshold = 0.08
     private let stationaryHeadingDeltaThreshold = 6.0
     private let stationarySampleThreshold = 5
+    private let stationaryBiasLearningRate = 0.02
     private let stoppedSpeedThreshold = 0.35
     private let roadMatchRefreshDistance = 12.0
     private let roadSnapMaximumDistance = 25.0
@@ -551,7 +552,12 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
             stationaryHeadingReference = currentHeading
         }
 
-        return stationarySampleCount >= stationarySampleThreshold
+        let isStationary = stationarySampleCount >= stationarySampleThreshold
+        if isStationary {
+            updateBiasEstimatesDuringStationaryPeriod(with: motion)
+        }
+
+        return isStationary
     }
 
     private func currentHeadingForStationaryDetection(from motion: CMDeviceMotion) -> Double? {
@@ -576,6 +582,22 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
             motion.rotationRate.y - rotationRateBias.y,
             motion.rotationRate.z - rotationRateBias.z
         )
+    }
+
+    private func updateBiasEstimatesDuringStationaryPeriod(with motion: CMDeviceMotion) {
+        let measuredAcceleration = SIMD3<Double>(
+            motion.userAcceleration.x,
+            motion.userAcceleration.y,
+            motion.userAcceleration.z
+        )
+        let measuredRotationRate = SIMD3<Double>(
+            motion.rotationRate.x,
+            motion.rotationRate.y,
+            motion.rotationRate.z
+        )
+
+        accelerationBias += (measuredAcceleration - accelerationBias) * stationaryBiasLearningRate
+        rotationRateBias += (measuredRotationRate - rotationRateBias) * stationaryBiasLearningRate
     }
 
     private func resetStationaryDetectionState() {
