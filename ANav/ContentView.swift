@@ -167,6 +167,20 @@ struct ContentView: View {
                             .font(.subheadline.weight(.semibold))
                             .foregroundStyle(.secondary)
 
+                        InertialActionButton(action: viewModel.startCalibration) {
+                            Label(
+                                viewModel.isCalibrationRunning
+                                    ? "Calibrating..."
+                                    : (viewModel.hasCompletedManualCalibration ? "Recalibrate" : "Calibrate"),
+                                systemImage: viewModel.hasCompletedManualCalibration ? "checkmark.circle" : "sensor.tag.radiowaves.forward"
+                            )
+                            .font(.caption.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                        }
+                        .disabled(viewModel.isCalibrationRunning)
+                        .opacity(viewModel.isCalibrationRunning ? 0.7 : 1)
+
                         HStack(spacing: 10) {
                             InertialActionButton(action: viewModel.resetInertialSpeed) {
                                 Label("Reset Inertial", systemImage: "arrow.counterclockwise")

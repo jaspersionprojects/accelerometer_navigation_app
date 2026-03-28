@@ -75,6 +75,8 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
     @Published private(set) var gpsSpeedMPH = 0.0
     @Published private(set) var inertialSpeedMPH = 0.0
     @Published private(set) var headingDegrees = 0.0
+    @Published private(set) var isCalibrationRunning = false
+    @Published private(set) var hasCompletedManualCalibration = false
 
     var gpsSpeedText: String {
         String(format: "%.1f mph", gpsSpeedMPH)
@@ -116,6 +118,10 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
     private let earthRadiusMeters = 6_378_137.0
     private let gravityMetersPerSecondSquared = 9.80665
     private let accelerationDeadband = 0.05
+    private let manualCalibrationDuration: TimeInterval = 3.0
+    private let manualCalibrationAccelerationThreshold = 0.06
+    private let manualCalibrationRotationRateThreshold = 0.12
+    private let manualCalibrationMinimumSamples = 20
     private let stationaryAccelerationThreshold = 0.045
     private let stationaryRotationRateThreshold = 0.08
     private let stationaryHeadingDeltaThreshold = 6.0
@@ -149,6 +155,12 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
     private var inertialVelocityMetersPerSecond = SIMD2<Double>(repeating: 0)
     private var lastMotionTimestamp: TimeInterval?
     private var motionHeadingDegrees: Double?
+    private var calibrationStartTimestamp: TimeInterval?
+    private var calibrationSampleCount = 0
+    private var calibrationAccelerationBiasAccumulator = SIMD3<Double>(repeating: 0)
+    private var calibrationRotationRateBiasAccumulator = SIMD3<Double>(repeating: 0)
+    private var accelerationBias = SIMD3<Double>(repeating: 0)
+    private var rotationRateBias = SIMD3<Double>(repeating: 0)
     private var stationarySampleCount = 0
     private var stationaryHeadingReference: Double?
     private var shouldAutoCenterMap = true
@@ -232,6 +244,20 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         lastMotionTimestamp = nil
         updateDerivedReadouts()
         statusText = "Inertial speed reset to 0."
+    }
+
+    func startCalibration() {
+        isCalibrationRunning = true
+        hasCompletedManualCalibration = false
+        calibrationStartTimestamp = nil
+        calibrationSampleCount = 0
+        calibrationAccelerationBiasAccumulator = .zero
+        calibrationRotationRateBiasAccumulator = .zero
+        accelerationBias = .zero
+        rotationRateBias = .zero
+        lastMotionTimestamp = nil
+        resetStationaryDetectionState()
+        statusText = "Hold still for calibration."
     }
 
     func startPlacingInertialPin() {
@@ -376,6 +402,18 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
             motionHeadingDegrees = normalize(angle: motion.heading)
         }
 
+        let wasCalibrationRunning = isCalibrationRunning
+        if isCalibrationRunning && !updateManualCalibration(with: motion) {
+            lastMotionTimestamp = motion.timestamp
+            updateDerivedReadouts()
+            return
+        }
+        if wasCalibrationRunning && !isCalibrationRunning {
+            lastMotionTimestamp = motion.timestamp
+            updateDerivedReadouts()
+            return
+        }
+
         guard let inertialOrigin else {
             lastMotionTimestamp = motion.timestamp
             resetStationaryDetectionState()
@@ -414,12 +452,66 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         updateRegion()
     }
 
+    private func updateManualCalibration(with motion: CMDeviceMotion) -> Bool {
+        let userAcceleration = SIMD3<Double>(
+            motion.userAcceleration.x,
+            motion.userAcceleration.y,
+            motion.userAcceleration.z
+        )
+        let rotationRate = SIMD3<Double>(
+            motion.rotationRate.x,
+            motion.rotationRate.y,
+            motion.rotationRate.z
+        )
+
+        let isStillEnough =
+            simd_length(userAcceleration) <= manualCalibrationAccelerationThreshold &&
+            simd_length(rotationRate) <= manualCalibrationRotationRateThreshold
+
+        guard isStillEnough else {
+            resetCalibrationCollection()
+            statusText = "Hold still for calibration."
+            return false
+        }
+
+        if calibrationStartTimestamp == nil {
+            calibrationStartTimestamp = motion.timestamp
+            calibrationSampleCount = 0
+            calibrationAccelerationBiasAccumulator = .zero
+            calibrationRotationRateBiasAccumulator = .zero
+            statusText = "Hold still for calibration."
+        }
+
+        calibrationSampleCount += 1
+        calibrationAccelerationBiasAccumulator += userAcceleration
+        calibrationRotationRateBiasAccumulator += rotationRate
+
+        let elapsed = motion.timestamp - (calibrationStartTimestamp ?? motion.timestamp)
+        guard
+            elapsed >= manualCalibrationDuration,
+            calibrationSampleCount >= manualCalibrationMinimumSamples
+        else {
+            return false
+        }
+
+        let sampleCount = Double(calibrationSampleCount)
+        accelerationBias = calibrationAccelerationBiasAccumulator / sampleCount
+        rotationRateBias = calibrationRotationRateBiasAccumulator / sampleCount
+        isCalibrationRunning = false
+        hasCompletedManualCalibration = true
+        resetCalibrationCollection()
+        resetStationaryDetectionState()
+        lastMotionTimestamp = motion.timestamp
+        statusText = "Finished calibration."
+        return true
+    }
+
     private func updateStationaryDetection(
         with motion: CMDeviceMotion,
         horizontalAcceleration: SIMD2<Double>
     ) -> Bool {
         let accelerationMagnitude = simd_length(horizontalAcceleration)
-        let rotationRate = motion.rotationRate
+        let rotationRate = calibratedRotationRate(from: motion)
         let rotationMagnitude = sqrt(
             rotationRate.x * rotationRate.x +
             rotationRate.y * rotationRate.y +
@@ -478,9 +570,24 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         return nil
     }
 
+    private func calibratedRotationRate(from motion: CMDeviceMotion) -> SIMD3<Double> {
+        SIMD3<Double>(
+            motion.rotationRate.x - rotationRateBias.x,
+            motion.rotationRate.y - rotationRateBias.y,
+            motion.rotationRate.z - rotationRateBias.z
+        )
+    }
+
     private func resetStationaryDetectionState() {
         stationarySampleCount = 0
         stationaryHeadingReference = nil
+    }
+
+    private func resetCalibrationCollection() {
+        calibrationStartTimestamp = nil
+        calibrationSampleCount = 0
+        calibrationAccelerationBiasAccumulator = .zero
+        calibrationRotationRateBiasAccumulator = .zero
     }
 
     private func seedInertialState(from location: CLLocation, resetMotionClock: Bool) {
@@ -1034,13 +1141,15 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
     }
 
     private func horizontalAccelerationMetersPerSecondSquared(from motion: CMDeviceMotion) -> SIMD2<Double> {
-        let acceleration = motion.userAcceleration
+        let accelerationX = motion.userAcceleration.x - accelerationBias.x
+        let accelerationY = motion.userAcceleration.y - accelerationBias.y
+        let accelerationZ = motion.userAcceleration.z - accelerationBias.z
         let rotation = motion.attitude.rotationMatrix
 
         // Core Motion reports the rotation matrix as the device attitude, so transpose it
         // to rotate the device-frame acceleration vector into the chosen reference frame.
-        let referenceX = rotation.m11 * acceleration.x + rotation.m21 * acceleration.y + rotation.m31 * acceleration.z
-        let referenceY = rotation.m12 * acceleration.x + rotation.m22 * acceleration.y + rotation.m32 * acceleration.z
+        let referenceX = rotation.m11 * accelerationX + rotation.m21 * accelerationY + rotation.m31 * accelerationZ
+        let referenceY = rotation.m12 * accelerationX + rotation.m22 * accelerationY + rotation.m32 * accelerationZ
 
         // In the north-aligned Core Motion reference frames, X points north and Y is the
         // horizontal east/west axis paired with gravity-aligned Z. Mapping Y directly to
