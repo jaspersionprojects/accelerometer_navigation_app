@@ -107,6 +107,7 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
     private let stoppedSpeedThreshold = 0.35
     private let roadMatchRefreshDistance = 12.0
     private let roadSnapMaximumDistance = 25.0
+    private let roadSnapWarningDistanceDriving = 9.0
     private let roadMissDistanceDriving = 20.0
     private let roadMissDistanceWalking = 18.0
     private let roadMissToleranceDriving = 8
@@ -114,10 +115,11 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
     private let drivingRoadMatchMinimumSpeed = 1.5
     private let walkingRoadMatchMinimumSpeed = 0.8
     private let drivingRoadMatchRefreshHeadingDelta = 25.0
+    private let drivingRoadMatchTurnHeadingDelta = 18.0
     private let walkingRoadMatchRefreshHeadingDelta = 40.0
     private let drivingRoadMatchRefreshInterval: TimeInterval = 3.0
     private let walkingRoadMatchRefreshInterval: TimeInterval = 8.0
-    private let drivingRoadMatchProjectionDistance = 45.0
+    private let drivingRoadMatchProjectionDistance = 70.0
     private let walkingRoadMatchProjectionDistance = 18.0
     private let walkingRoadSeedMaximumDistanceFromGPS = 15.0
     private let trailMinimumSegmentDistance = 1.5
@@ -262,10 +264,6 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         if inertialOrigin == nil {
             seedInertialState(from: location, resetMotionClock: true)
             statusText = "GPS locked. Inertial navigation seeded from GPS."
-        } else if location.speed >= 0, location.course >= 0 {
-            inertialVelocityMetersPerSecond = velocityVector(from: location)
-        } else if location.speed >= 0, location.speed < stoppedSpeedThreshold {
-            inertialVelocityMetersPerSecond = .zero
         }
 
         updateDerivedReadouts()
@@ -520,12 +518,17 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         }
 
         let shouldForceRawStart = shouldForceRouteRefresh(rawCoordinate: rawCoordinate, tolerance: roadMissDistanceDriving)
+        let shouldPreferRawStart = shouldPreferRawStartForDrivingRefresh(
+            rawCoordinate: rawCoordinate,
+            heading: heading,
+            snap: snap
+        )
         if shouldForceRawStart || shouldRefreshRoadMatch(for: rawCoordinate, heading: heading) {
             refreshRoadMatch(
                 from: rawCoordinate,
                 heading: heading,
                 speedMetersPerSecond: speedMetersPerSecond,
-                preferRawStart: shouldForceRawStart || roadMatchState == nil
+                preferRawStart: shouldForceRawStart || shouldPreferRawStart || roadMatchState == nil
             )
         }
     }
@@ -538,9 +541,11 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
             .distance(from: CLLocation(latitude: matchState.lastRefreshCoordinate.latitude, longitude: matchState.lastRefreshCoordinate.longitude))
         let headingDelta = abs(normalizedDeltaDegrees(heading, matchState.lastRefreshHeading))
         let age = Date().timeIntervalSince(matchState.lastRefreshDate)
+        let routeHeadingDelta = currentRouteHeadingDelta(for: heading) ?? 0
 
         return movedDistance >= roadMatchRefreshDistance ||
             headingDelta >= activeRoadMatchRefreshHeadingDelta ||
+            routeHeadingDelta >= drivingRoadMatchTurnHeadingDelta ||
             age >= activeRoadMatchRefreshInterval
     }
 
@@ -575,7 +580,9 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         speedMetersPerSecond: Double,
         preferRawStart: Bool
     ) {
-        let startCoordinate = preferRawStart ? coordinate : (roadMatchState?.lastSnappedCoordinate ?? lastLocation?.coordinate ?? coordinate)
+        let startCoordinate = preferRawStart
+            ? coordinate
+            : ((roadMatchState?.isLocked == true ? roadMatchState?.lastSnappedCoordinate : nil) ?? lastLocation?.coordinate ?? coordinate)
         let projectionDistance = max(activeRoadMatchProjectionDistance, speedMetersPerSecond * 6.0)
         let destinationCoordinate = startCoordinate.offsetBy(
             eastMeters: sin(heading * .pi / 180) * projectionDistance,
@@ -586,21 +593,30 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         roadMatchTask?.cancel()
         roadMatchTask = Task { [weak self] in
             guard let self else { return }
-            let routeCoordinates = await self.fetchRoadRoute(from: startCoordinate, to: destinationCoordinate)
+            let routeCandidates = await self.fetchRoadRoutes(from: startCoordinate, to: destinationCoordinate)
 
             await MainActor.run {
                 guard !Task.isCancelled else { return }
                 self.roadMatchTask = nil
 
-                guard let routeCoordinates, routeCoordinates.count >= 2 else { return }
+                guard let routeCandidates else { return }
+                let validRouteCandidates = routeCandidates.filter { $0.count >= 2 }
+                guard !validRouteCandidates.isEmpty else { return }
 
                 let previousState = self.roadMatchState
                 let baseProgress = previousState?.lastProgressDistance ?? 0
                 let wasLocked = previousState?.isLocked == true
+                let progressSeed = preferRawStart || !wasLocked ? 0 : baseProgress
+                let selectedRouteCoordinates = self.bestRouteCoordinates(
+                    from: validRouteCandidates,
+                    rawCoordinate: self.rawInertialCoordinate ?? coordinate,
+                    heading: heading,
+                    lastProgressDistance: progressSeed
+                ) ?? validRouteCandidates[0]
                 var nextRoadMatchState = RoadMatchState(
-                    routeCoordinates: routeCoordinates,
+                    routeCoordinates: selectedRouteCoordinates,
                     lastSnappedCoordinate: startCoordinate,
-                    lastProgressDistance: baseProgress,
+                    lastProgressDistance: progressSeed,
                     lastRefreshCoordinate: coordinate,
                     lastRefreshHeading: heading,
                     lastRefreshDate: Date(),
@@ -611,8 +627,8 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
                 if let rawInertialCoordinate = self.rawInertialCoordinate,
                    let match = self.snapToRoute(
                     rawCoordinate: rawInertialCoordinate,
-                    routeCoordinates: routeCoordinates,
-                    lastProgressDistance: baseProgress
+                    routeCoordinates: selectedRouteCoordinates,
+                    lastProgressDistance: progressSeed
                    ) {
                     nextRoadMatchState.lastSnappedCoordinate = match.coordinate
                     nextRoadMatchState.lastProgressDistance = match.progressDistance
@@ -628,21 +644,91 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         }
     }
 
-    private func fetchRoadRoute(from start: CLLocationCoordinate2D, to end: CLLocationCoordinate2D) async -> [CLLocationCoordinate2D]? {
+    private func fetchRoadRoutes(from start: CLLocationCoordinate2D, to end: CLLocationCoordinate2D) async -> [[CLLocationCoordinate2D]]? {
         let request = MKDirections.Request()
         request.source = MKMapItem(placemark: MKPlacemark(coordinate: start))
         request.destination = MKMapItem(placemark: MKPlacemark(coordinate: end))
         request.transportType = movementMode == .driving ? .automobile : .walking
-        request.requestsAlternateRoutes = false
+        request.requestsAlternateRoutes = movementMode == .driving
 
         let directions = MKDirections(request: request)
 
         do {
             let response = try await directions.calculate()
-            return response.routes.first?.polyline.coordinates
+            let routes = response.routes.map(\.polyline.coordinates).filter { $0.count >= 2 }
+            return routes.isEmpty ? nil : routes
         } catch {
             return nil
         }
+    }
+
+    private func shouldPreferRawStartForDrivingRefresh(
+        rawCoordinate: CLLocationCoordinate2D,
+        heading: Double,
+        snap: (coordinate: CLLocationCoordinate2D, progressDistance: Double, distanceFromRaw: Double)?
+    ) -> Bool {
+        guard let roadMatchState else { return true }
+        guard roadMatchState.isLocked else { return true }
+
+        if let snap, snap.distanceFromRaw >= roadSnapWarningDistanceDriving {
+            return true
+        }
+
+        if shouldForceRouteRefresh(rawCoordinate: rawCoordinate, tolerance: roadSnapWarningDistanceDriving) {
+            return true
+        }
+
+        if let routeHeadingDelta = currentRouteHeadingDelta(for: heading),
+           routeHeadingDelta >= drivingRoadMatchTurnHeadingDelta {
+            return true
+        }
+
+        return false
+    }
+
+    private func currentRouteHeadingDelta(for heading: Double) -> Double? {
+        guard
+            let roadMatchState,
+            let routeHeading = routeHeading(
+                on: roadMatchState.routeCoordinates,
+                near: roadMatchState.lastProgressDistance
+            )
+        else {
+            return nil
+        }
+
+        return abs(normalizedDeltaDegrees(heading, routeHeading))
+    }
+
+    private func bestRouteCoordinates(
+        from routeCandidates: [[CLLocationCoordinate2D]],
+        rawCoordinate: CLLocationCoordinate2D,
+        heading: Double,
+        lastProgressDistance: Double
+    ) -> [CLLocationCoordinate2D]? {
+        var bestRoute: [CLLocationCoordinate2D]?
+        var bestScore = Double.greatestFiniteMagnitude
+
+        for routeCoordinates in routeCandidates {
+            guard let match = snapToRoute(
+                rawCoordinate: rawCoordinate,
+                routeCoordinates: routeCoordinates,
+                lastProgressDistance: lastProgressDistance
+            ) else {
+                continue
+            }
+
+            let routeHeading = routeHeading(on: routeCoordinates, near: match.progressDistance) ?? heading
+            let headingDelta = abs(normalizedDeltaDegrees(heading, routeHeading))
+            let score = match.distanceFromRaw + headingDelta * 0.35
+
+            if score < bestScore {
+                bestScore = score
+                bestRoute = routeCoordinates
+            }
+        }
+
+        return bestRoute
     }
 
     private func snapToCurrentRoute(rawCoordinate: CLLocationCoordinate2D) -> (coordinate: CLLocationCoordinate2D, progressDistance: Double, distanceFromRaw: Double)? {
@@ -692,6 +778,46 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         }
 
         return (bestSnap.coordinate, bestSnap.progressDistance, bestSnap.distance)
+    }
+
+    private func routeHeading(
+        on routeCoordinates: [CLLocationCoordinate2D],
+        near progressDistance: Double
+    ) -> Double? {
+        guard routeCoordinates.count >= 2 else { return nil }
+
+        var runningDistance = 0.0
+
+        for index in 0..<(routeCoordinates.count - 1) {
+            let start = routeCoordinates[index]
+            let end = routeCoordinates[index + 1]
+            let segmentLength = CLLocation(latitude: start.latitude, longitude: start.longitude)
+                .distance(from: CLLocation(latitude: end.latitude, longitude: end.longitude))
+
+            guard segmentLength > 0.1 else { continue }
+
+            let lowerBound = runningDistance - 6.0
+            let upperBound = runningDistance + segmentLength + 6.0
+            if progressDistance >= lowerBound, progressDistance <= upperBound {
+                let segmentVector = end.localMeters(from: start, earthRadiusMeters: earthRadiusMeters)
+                let velocity = SIMD2<Double>(segmentVector.eastMeters, segmentVector.northMeters)
+                guard simd_length(velocity) > 0.1 else { return nil }
+                return courseDegrees(from: velocity)
+            }
+
+            runningDistance += segmentLength
+        }
+
+        guard let penultimate = routeCoordinates.dropLast().last,
+              let last = routeCoordinates.last
+        else {
+            return nil
+        }
+
+        let segmentVector = last.localMeters(from: penultimate, earthRadiusMeters: earthRadiusMeters)
+        let velocity = SIMD2<Double>(segmentVector.eastMeters, segmentVector.northMeters)
+        guard simd_length(velocity) > 0.1 else { return nil }
+        return courseDegrees(from: velocity)
     }
 
     private func nearestPointOnSegment(
