@@ -213,7 +213,7 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         locationManager.headingFilter = kCLHeadingFilterNone
         locationManager.pausesLocationUpdatesAutomatically = false
 
-        motionManager.deviceMotionUpdateInterval = 0.1
+        motionManager.deviceMotionUpdateInterval = 0.05
 
         startMotionUpdates()
         handleAuthorization(locationManager.authorizationStatus)
@@ -1017,8 +1017,8 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         let snapDistance = rawLocation.distance(from: snappedLocation)
         let distanceScore = max(0, 1 - (snapDistance / roadSnapMaximumDistance))
 
-        let routeHeading = routeCoordinates.flatMap { routeHeading(on: $0, near: progressDistance) } ?? heading
-        let headingDelta = abs(normalizedDeltaDegrees(heading, routeHeading))
+        let matchedRouteHeading = routeCoordinates.flatMap { routeHeading(on: $0, near: progressDistance) } ?? heading
+        let headingDelta = abs(normalizedDeltaDegrees(heading, matchedRouteHeading))
         let headingScore = max(0, 1 - (headingDelta / 90))
 
         let missPenalty = min(Double(roadMatchState?.consecutiveMisses ?? 0) * 0.08, 0.4)
