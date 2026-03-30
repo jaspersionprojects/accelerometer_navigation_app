@@ -57,6 +57,12 @@ private struct RoadMatchState {
     var confidence: Double
 }
 
+struct CSVExportPayload {
+    let id = UUID()
+    let fileName: String
+    let csvText: String
+}
+
 @MainActor
 final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDelegate {
     static let defaultRegion = MKCoordinateRegion(
@@ -81,6 +87,8 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
     @Published private(set) var hasCompletedManualCalibration = false
     @Published private(set) var roadConfidenceCoordinate: CLLocationCoordinate2D?
     @Published private(set) var roadConfidenceValue: Double?
+    @Published private(set) var isLoggingSessionActive = false
+    @Published private(set) var pendingCSVExport: CSVExportPayload?
 
     var gpsSpeedText: String {
         String(format: "%.1f mph", gpsSpeedMPH)
@@ -165,6 +173,60 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
     private let walkingRoadSeedMaximumDistanceFromGPS = 15.0
     private let trailMinimumSegmentDistance = 1.5
     private let maximumTrailPointCount = 3_000
+    private let csvCoordinatePrecision = 8
+    private let csvScalarPrecision = 6
+    private let csvMotionLogHeader = [
+        "timestampISO8601",
+        "sampleIndex",
+        "motionTimestampSeconds",
+        "rawDeltaTimeSeconds",
+        "deltaTimeSeconds",
+        "movementMode",
+        "referenceFrame",
+        "isCalibrationRunning",
+        "hasCompletedManualCalibration",
+        "rawAccelXG",
+        "rawAccelYG",
+        "rawAccelZG",
+        "biasCorrectedAccelXG",
+        "biasCorrectedAccelYG",
+        "biasCorrectedAccelZG",
+        "horizontalAccelEastMps2",
+        "horizontalAccelNorthMps2",
+        "rawGyroXRadPerSec",
+        "rawGyroYRadPerSec",
+        "rawGyroZRadPerSec",
+        "biasCorrectedGyroXRadPerSec",
+        "biasCorrectedGyroYRadPerSec",
+        "biasCorrectedGyroZRadPerSec",
+        "motionHeadingDegrees",
+        "externalHeadingDegrees",
+        "fusedHeadingDegrees",
+        "gpsCourseDegrees",
+        "gpsSpeedMps",
+        "yawRateReferenceDegreesPerSecond",
+        "eastVelocityMps",
+        "northVelocityMps",
+        "inertialSpeedMps",
+        "eastOffsetMeters",
+        "northOffsetMeters",
+        "gpsLatitude",
+        "gpsLongitude",
+        "rawInertialLatitude",
+        "rawInertialLongitude",
+        "displayedInertialLatitude",
+        "displayedInertialLongitude",
+        "isRoadLocked",
+        "roadConfidence",
+        "stationaryFlag",
+        "stationarySampleCount",
+        "accelBiasXG",
+        "accelBiasYG",
+        "accelBiasZG",
+        "gyroBiasXRadPerSec",
+        "gyroBiasYRadPerSec",
+        "gyroBiasZRadPerSec"
+    ].joined(separator: ",")
 
     private var hasStarted = false
     private var lastLocation: CLLocation?
@@ -188,6 +250,14 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
     private var shouldAutoCenterMap = true
     private var roadMatchState: RoadMatchState?
     private var roadMatchTask: Task<Void, Never>?
+    private var csvLogRows: [String] = []
+    private var csvLogSampleIndex = 0
+    private var csvLogStartedAt = Date()
+    private let csvTimestampFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
 
     private var markerSeparationMeters: Double? {
         guard
@@ -278,6 +348,49 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         lastMotionTimestamp = nil
         updateDerivedReadouts()
         statusText = "Inertial speed reset to 0."
+    }
+
+    func startCSVLogging() {
+        csvLogRows = [csvMotionLogHeader]
+        csvLogSampleIndex = 0
+        csvLogStartedAt = Date()
+        isLoggingSessionActive = true
+        pendingCSVExport = nil
+        statusText = "Logging started."
+    }
+
+    func stopCSVLogging() {
+        guard isLoggingSessionActive else { return }
+        isLoggingSessionActive = false
+
+        guard csvLogRows.count > 1 else {
+            statusText = "No motion samples were captured."
+            csvLogRows.removeAll()
+            return
+        }
+
+        let fileName = "ANav-log-\(fileTimestampString(from: csvLogStartedAt)).csv"
+        pendingCSVExport = CSVExportPayload(
+            fileName: fileName,
+            csvText: csvLogRows.joined(separator: "\n")
+        )
+        statusText = "Choose where to save the CSV in Files."
+    }
+
+    func handleCSVExportCompletion(_ result: Result<URL, Error>) {
+        switch result {
+        case .success:
+            statusText = "CSV saved to Files."
+        case .failure(let error):
+            let nsError = error as NSError
+            if nsError.domain == NSCocoaErrorDomain, nsError.code == NSUserCancelledError {
+                statusText = "CSV export cancelled."
+            } else {
+                statusText = "CSV export failed: \(error.localizedDescription)"
+            }
+        }
+
+        pendingCSVExport = nil
     }
 
     func startCalibration() {
@@ -438,6 +551,12 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
     }
 
     private func handleDeviceMotion(_ motion: CMDeviceMotion) {
+        let rawAcceleration = rawUserAcceleration(from: motion)
+        let correctedAcceleration = biasCorrectedAcceleration(from: motion)
+        let rawRotationRate = rawRotationRate(from: motion)
+        let correctedRotationRate = calibratedRotationRate(from: motion)
+        let motionHeading = motion.heading >= 0 ? normalize(angle: motion.heading) : nil
+
         if motion.heading >= 0 {
             externalHeadingDegrees = normalize(angle: motion.heading)
         }
@@ -446,11 +565,35 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         let wasCalibrationRunning = isCalibrationRunning
         if isCalibrationRunning && !updateManualCalibration(with: motion) {
             lastMotionTimestamp = motion.timestamp
+            appendCSVLogRow(
+                motion: motion,
+                rawDeltaTime: nil,
+                deltaTime: nil,
+                rawAcceleration: rawAcceleration,
+                correctedAcceleration: correctedAcceleration,
+                horizontalAcceleration: nil,
+                rawRotationRate: rawRotationRate,
+                correctedRotationRate: correctedRotationRate,
+                motionHeading: motionHeading,
+                stationaryFlag: false
+            )
             updateDerivedReadouts()
             return
         }
         if wasCalibrationRunning && !isCalibrationRunning {
             lastMotionTimestamp = motion.timestamp
+            appendCSVLogRow(
+                motion: motion,
+                rawDeltaTime: nil,
+                deltaTime: nil,
+                rawAcceleration: rawAcceleration,
+                correctedAcceleration: correctedAcceleration,
+                horizontalAcceleration: nil,
+                rawRotationRate: rawRotationRate,
+                correctedRotationRate: correctedRotationRate,
+                motionHeading: motionHeading,
+                stationaryFlag: false
+            )
             updateDerivedReadouts()
             return
         }
@@ -458,6 +601,18 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         guard let inertialOrigin else {
             lastMotionTimestamp = motion.timestamp
             resetStationaryDetectionState()
+            appendCSVLogRow(
+                motion: motion,
+                rawDeltaTime: nil,
+                deltaTime: nil,
+                rawAcceleration: rawAcceleration,
+                correctedAcceleration: correctedAcceleration,
+                horizontalAcceleration: nil,
+                rawRotationRate: rawRotationRate,
+                correctedRotationRate: correctedRotationRate,
+                motionHeading: motionHeading,
+                stationaryFlag: false
+            )
             updateDerivedReadouts()
             return
         }
@@ -465,6 +620,18 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         guard let lastMotionTimestamp else {
             self.lastMotionTimestamp = motion.timestamp
             resetStationaryDetectionState()
+            appendCSVLogRow(
+                motion: motion,
+                rawDeltaTime: nil,
+                deltaTime: nil,
+                rawAcceleration: rawAcceleration,
+                correctedAcceleration: correctedAcceleration,
+                horizontalAcceleration: nil,
+                rawRotationRate: rawRotationRate,
+                correctedRotationRate: correctedRotationRate,
+                motionHeading: motionHeading,
+                stationaryFlag: false
+            )
             updateDerivedReadouts()
             return
         }
@@ -473,11 +640,15 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         let deltaTime = min(max(rawDeltaTime, 0.05), 0.2)
         self.lastMotionTimestamp = motion.timestamp
 
-        let horizontalAcceleration = horizontalAccelerationMetersPerSecondSquared(from: motion)
+        let horizontalAcceleration = horizontalAccelerationMetersPerSecondSquared(
+            from: motion,
+            correctedAcceleration: correctedAcceleration
+        )
         inertialOffsetMeters += inertialVelocityMetersPerSecond * deltaTime + 0.5 * horizontalAcceleration * deltaTime * deltaTime
         inertialVelocityMetersPerSecond += horizontalAcceleration * deltaTime
 
-        if updateStationaryDetection(with: motion, horizontalAcceleration: horizontalAcceleration) {
+        let isStationary = updateStationaryDetection(with: motion, horizontalAcceleration: horizontalAcceleration)
+        if isStationary {
             inertialVelocityMetersPerSecond = .zero
         }
 
@@ -490,6 +661,18 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         rawInertialCoordinate = coordinate
         updateRoadMatchedCoordinate(using: coordinate)
         updateDerivedReadouts()
+        appendCSVLogRow(
+            motion: motion,
+            rawDeltaTime: rawDeltaTime,
+            deltaTime: deltaTime,
+            rawAcceleration: rawAcceleration,
+            correctedAcceleration: correctedAcceleration,
+            horizontalAcceleration: horizontalAcceleration,
+            rawRotationRate: rawRotationRate,
+            correctedRotationRate: correctedRotationRate,
+            motionHeading: motionHeading,
+            stationaryFlag: isStationary
+        )
         updateRegion()
     }
 
@@ -616,12 +799,28 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         return nil
     }
 
-    private func calibratedRotationRate(from motion: CMDeviceMotion) -> SIMD3<Double> {
+    private func rawUserAcceleration(from motion: CMDeviceMotion) -> SIMD3<Double> {
         SIMD3<Double>(
-            motion.rotationRate.x - rotationRateBias.x,
-            motion.rotationRate.y - rotationRateBias.y,
-            motion.rotationRate.z - rotationRateBias.z
+            motion.userAcceleration.x,
+            motion.userAcceleration.y,
+            motion.userAcceleration.z
         )
+    }
+
+    private func biasCorrectedAcceleration(from motion: CMDeviceMotion) -> SIMD3<Double> {
+        rawUserAcceleration(from: motion) - accelerationBias
+    }
+
+    private func rawRotationRate(from motion: CMDeviceMotion) -> SIMD3<Double> {
+        SIMD3<Double>(
+            motion.rotationRate.x,
+            motion.rotationRate.y,
+            motion.rotationRate.z
+        )
+    }
+
+    private func calibratedRotationRate(from motion: CMDeviceMotion) -> SIMD3<Double> {
+        rawRotationRate(from: motion) - rotationRateBias
     }
 
     private func updateBiasEstimatesDuringStationaryPeriod(with motion: CMDeviceMotion) {
@@ -1297,10 +1496,14 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         return SIMD2<Double>(eastVelocity, northVelocity)
     }
 
-    private func horizontalAccelerationMetersPerSecondSquared(from motion: CMDeviceMotion) -> SIMD2<Double> {
-        let accelerationX = motion.userAcceleration.x - accelerationBias.x
-        let accelerationY = motion.userAcceleration.y - accelerationBias.y
-        let accelerationZ = motion.userAcceleration.z - accelerationBias.z
+    private func horizontalAccelerationMetersPerSecondSquared(
+        from motion: CMDeviceMotion,
+        correctedAcceleration: SIMD3<Double>? = nil
+    ) -> SIMD2<Double> {
+        let correctedAcceleration = correctedAcceleration ?? biasCorrectedAcceleration(from: motion)
+        let accelerationX = correctedAcceleration.x
+        let accelerationY = correctedAcceleration.y
+        let accelerationZ = correctedAcceleration.z
         let rotation = motion.attitude.rotationMatrix
 
         // Core Motion reports the rotation matrix as the device attitude, so transpose it
@@ -1308,12 +1511,12 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         let referenceX = rotation.m11 * accelerationX + rotation.m21 * accelerationY + rotation.m31 * accelerationZ
         let referenceY = rotation.m12 * accelerationX + rotation.m22 * accelerationY + rotation.m32 * accelerationZ
 
-        // In the north-aligned Core Motion reference frames, X points north and Y is the
-        // horizontal east/west axis paired with gravity-aligned Z. Mapping Y directly to
-        // east avoids mirroring left/right turns on the map.
+        // In the north-aligned Core Motion reference frames, X points along the north axis
+        // but the observed map motion is mirrored unless we flip that north component when
+        // projecting into map east/north coordinates.
         var eastNorthAcceleration = SIMD2<Double>(
             referenceY * gravityMetersPerSecondSquared,
-            referenceX * gravityMetersPerSecondSquared
+            -referenceX * gravityMetersPerSecondSquared
         )
 
         if simd_length(eastNorthAcceleration) < accelerationDeadband {
@@ -1402,6 +1605,110 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         if trail.count > maximumTrailPointCount {
             trail.removeFirst(trail.count - maximumTrailPointCount)
         }
+    }
+
+    private func appendCSVLogRow(
+        motion: CMDeviceMotion,
+        rawDeltaTime: Double?,
+        deltaTime: Double?,
+        rawAcceleration: SIMD3<Double>,
+        correctedAcceleration: SIMD3<Double>,
+        horizontalAcceleration: SIMD2<Double>?,
+        rawRotationRate: SIMD3<Double>,
+        correctedRotationRate: SIMD3<Double>,
+        motionHeading: Double?,
+        stationaryFlag: Bool
+    ) {
+        guard isLoggingSessionActive else { return }
+
+        let displayedInertialCoordinate = annotations.first(where: { $0.id == "inertial" })?.coordinate
+        let gpsCoordinate = lastLocation?.coordinate
+        let inertialSpeedMetersPerSecond = simd_length(inertialVelocityMetersPerSecond)
+
+        let row: [String] = [
+            csvString(csvTimestampFormatter.string(from: Date())),
+            "\(csvLogSampleIndex)",
+            csvDouble(motion.timestamp),
+            csvDouble(rawDeltaTime),
+            csvDouble(deltaTime),
+            csvString(movementMode.rawValue),
+            csvString(referenceFrameText),
+            csvBool(isCalibrationRunning),
+            csvBool(hasCompletedManualCalibration),
+            csvDouble(rawAcceleration.x),
+            csvDouble(rawAcceleration.y),
+            csvDouble(rawAcceleration.z),
+            csvDouble(correctedAcceleration.x),
+            csvDouble(correctedAcceleration.y),
+            csvDouble(correctedAcceleration.z),
+            csvDouble(horizontalAcceleration?.x),
+            csvDouble(horizontalAcceleration?.y),
+            csvDouble(rawRotationRate.x),
+            csvDouble(rawRotationRate.y),
+            csvDouble(rawRotationRate.z),
+            csvDouble(correctedRotationRate.x),
+            csvDouble(correctedRotationRate.y),
+            csvDouble(correctedRotationRate.z),
+            csvDouble(motionHeading),
+            csvDouble(externalHeadingDegrees),
+            csvDouble(motionHeadingDegrees),
+            csvDouble(lastLocation?.course),
+            csvDouble(lastLocation?.speed),
+            csvDouble(lastReferenceYawRateDegreesPerSecond),
+            csvDouble(inertialVelocityMetersPerSecond.x),
+            csvDouble(inertialVelocityMetersPerSecond.y),
+            csvDouble(inertialSpeedMetersPerSecond),
+            csvDouble(inertialOffsetMeters.x),
+            csvDouble(inertialOffsetMeters.y),
+            csvDouble(gpsCoordinate?.latitude, precision: csvCoordinatePrecision),
+            csvDouble(gpsCoordinate?.longitude, precision: csvCoordinatePrecision),
+            csvDouble(rawInertialCoordinate?.latitude, precision: csvCoordinatePrecision),
+            csvDouble(rawInertialCoordinate?.longitude, precision: csvCoordinatePrecision),
+            csvDouble(displayedInertialCoordinate?.latitude, precision: csvCoordinatePrecision),
+            csvDouble(displayedInertialCoordinate?.longitude, precision: csvCoordinatePrecision),
+            csvBool(roadMatchState?.isLocked == true),
+            csvDouble(roadMatchState?.confidence),
+            csvBool(stationaryFlag),
+            "\(stationarySampleCount)",
+            csvDouble(accelerationBias.x),
+            csvDouble(accelerationBias.y),
+            csvDouble(accelerationBias.z),
+            csvDouble(rotationRateBias.x),
+            csvDouble(rotationRateBias.y),
+            csvDouble(rotationRateBias.z)
+        ]
+
+        csvLogRows.append(row.joined(separator: ","))
+        csvLogSampleIndex += 1
+    }
+
+    private func fileTimestampString(from date: Date) -> String {
+        let components = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute, .second], from: date)
+        return String(
+            format: "%04d-%02d-%02d_%02d-%02d-%02d",
+            components.year ?? 0,
+            components.month ?? 0,
+            components.day ?? 0,
+            components.hour ?? 0,
+            components.minute ?? 0,
+            components.second ?? 0
+        )
+    }
+
+    private func csvString(_ string: String?) -> String {
+        guard let string else { return "" }
+        let escaped = string.replacingOccurrences(of: "\"", with: "\"\"")
+        return "\"\(escaped)\""
+    }
+
+    private func csvBool(_ value: Bool) -> String {
+        value ? "true" : "false"
+    }
+
+    private func csvDouble(_ value: Double?, precision: Int? = nil) -> String {
+        guard let value else { return "" }
+        let precision = precision ?? csvScalarPrecision
+        return String(format: "%.\(precision)f", value)
     }
 }
 

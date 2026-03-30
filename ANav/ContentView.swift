@@ -5,8 +5,10 @@
 //  Created by Jasper Sion on 17/03/2026.
 //
 
+import Combine
 import MapKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @StateObject private var viewModel = NavigationViewModel()
@@ -14,6 +16,9 @@ struct ContentView: View {
     @State private var panelHeight: CGFloat = 0
     @GestureState private var panelDragTranslation: CGFloat = 0
     @State private var selectedPanelPage = 0
+    @State private var isExportingCSV = false
+    @State private var csvExportDocument = CSVExportDocument(text: "")
+    @State private var csvExportFilename = "ANav-log"
 
     var body: some View {
         ZStack(alignment: .bottom) {
@@ -145,6 +150,30 @@ struct ContentView: View {
                             )
                         }
 
+                        HStack(spacing: 10) {
+                            MainPanelActionButton(
+                                title: viewModel.isLoggingSessionActive ? "Logging..." : "Start Log",
+                                systemImage: "record.circle",
+                                tint: Color(red: 0.80, green: 0.16, blue: 0.20),
+                                isEmphasized: viewModel.isLoggingSessionActive
+                            ) {
+                                viewModel.startCSVLogging()
+                            }
+                            .disabled(viewModel.isLoggingSessionActive)
+                            .opacity(viewModel.isLoggingSessionActive ? 0.75 : 1)
+
+                            MainPanelActionButton(
+                                title: "Stop Log",
+                                systemImage: "stop.circle",
+                                tint: Color(red: 0.31, green: 0.33, blue: 0.39),
+                                isEmphasized: false
+                            ) {
+                                viewModel.stopCSVLogging()
+                            }
+                            .disabled(!viewModel.isLoggingSessionActive)
+                            .opacity(viewModel.isLoggingSessionActive ? 1 : 0.55)
+                        }
+
                         Button(action: viewModel.snapToGPS) {
                             Label("Snap To GPS", systemImage: "location.circle.fill")
                                 .font(.headline.weight(.semibold))
@@ -248,7 +277,7 @@ struct ContentView: View {
                     .padding(.horizontal, 2)
                 }
                 .tabViewStyle(.page(indexDisplayMode: .never))
-                .frame(height: 292)
+                .frame(height: 346)
 
                 HStack(spacing: 8) {
                     ForEach(0..<2, id: \.self) { page in
@@ -276,6 +305,19 @@ struct ContentView: View {
             .animation(.spring(response: 0.28, dampingFraction: 0.84), value: isPanelMinimized)
             .padding(.horizontal, 16)
             .padding(.bottom, 20)
+        }
+        .fileExporter(
+            isPresented: $isExportingCSV,
+            document: csvExportDocument,
+            contentType: .commaSeparatedText,
+            defaultFilename: csvExportFilename
+        ) { result in
+            viewModel.handleCSVExportCompletion(result)
+        }
+        .onReceive(viewModel.$pendingCSVExport.compactMap { $0 }) { payload in
+            csvExportDocument = CSVExportDocument(text: payload.csvText)
+            csvExportFilename = payload.fileName
+            isExportingCSV = true
         }
         .onAppear(perform: viewModel.start)
     }
@@ -317,6 +359,29 @@ private struct PanelHeightPreferenceKey: PreferenceKey {
     }
 }
 
+private struct CSVExportDocument: FileDocument {
+    static var readableContentTypes: [UTType] { [.commaSeparatedText] }
+
+    var text: String
+
+    init(text: String) {
+        self.text = text
+    }
+
+    init(configuration: ReadConfiguration) throws {
+        if let data = configuration.file.regularFileContents,
+           let text = String(data: data, encoding: .utf8) {
+            self.text = text
+        } else {
+            self.text = ""
+        }
+    }
+
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
+        FileWrapper(regularFileWithContents: Data(text.utf8))
+    }
+}
+
 private struct StatCard: View {
     let title: String
     let value: String
@@ -336,6 +401,33 @@ private struct StatCard: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(14)
         .background(accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+}
+
+private struct MainPanelActionButton: View {
+    let title: String
+    let systemImage: String
+    let tint: Color
+    let isEmphasized: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Label(title, systemImage: systemImage)
+                .font(.caption.weight(.semibold))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 10)
+                .foregroundStyle(isEmphasized ? .white : .primary)
+                .background(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(isEmphasized ? tint : tint.opacity(0.13))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .strokeBorder(tint.opacity(isEmphasized ? 0 : 0.3), lineWidth: 1)
+                )
+        }
+        .buttonStyle(.plain)
     }
 }
 
