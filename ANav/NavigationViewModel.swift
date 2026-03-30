@@ -143,9 +143,11 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
     private let manualCalibrationAccelerationThreshold = 0.06
     private let manualCalibrationRotationRateThreshold = 0.12
     private let manualCalibrationMinimumSamples = 20
-    private let stationaryAccelerationThreshold = 0.045
+    private let stationaryAccelerationThreshold = 0.12
     private let stationaryRotationRateThreshold = 0.08
-    private let stationaryHeadingDeltaThreshold = 6.0
+    private let stationaryHeadingDeltaThreshold = 8.0
+    private let stationaryGPSAssistSpeedThreshold = 0.8
+    private let stationaryGPSAssistAccelerationThreshold = 0.8
     private let stationarySampleThreshold = 5
     private let stationaryBiasLearningRate = 0.02
     private let headingTurnRateThresholdDegreesPerSecond = 12.0
@@ -755,7 +757,16 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
             headingIsStable = true
         }
 
+        let gpsSpeed = max(lastLocation?.speed ?? -1, 0)
+        let isGPSAssistedStationary =
+            gpsSpeed >= 0 &&
+            gpsSpeed <= stationaryGPSAssistSpeedThreshold &&
+            accelerationMagnitude <= stationaryGPSAssistAccelerationThreshold &&
+            rotationMagnitude <= stationaryRotationRateThreshold &&
+            headingIsStable
+
         let isCandidateStationary =
+            isGPSAssistedStationary ||
             accelerationMagnitude <= stationaryAccelerationThreshold &&
             rotationMagnitude <= stationaryRotationRateThreshold &&
             headingIsStable
@@ -1511,12 +1522,12 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         let referenceX = rotation.m11 * accelerationX + rotation.m21 * accelerationY + rotation.m31 * accelerationZ
         let referenceY = rotation.m12 * accelerationX + rotation.m22 * accelerationY + rotation.m32 * accelerationZ
 
-        // In the north-aligned Core Motion reference frames, X points along the north axis
-        // but the observed map motion is mirrored unless we flip that north component when
-        // projecting into map east/north coordinates.
+        // In the north-aligned Core Motion reference frames, X maps directly to the north
+        // axis on the map. The CSV traces showed the previous flipped sign was sending the
+        // inertial path south when GPS was moving north.
         var eastNorthAcceleration = SIMD2<Double>(
             referenceY * gravityMetersPerSecondSquared,
-            -referenceX * gravityMetersPerSecondSquared
+            referenceX * gravityMetersPerSecondSquared
         )
 
         if simd_length(eastNorthAcceleration) < accelerationDeadband {
