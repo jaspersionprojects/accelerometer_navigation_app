@@ -36,6 +36,14 @@ struct ContentView: View {
                             AnnotationBadge(annotation: annotation)
                         }
                     }
+
+                    if viewModel.isRoadConfidenceVisible,
+                       let coordinate = viewModel.displayedRoadConfidenceCoordinate,
+                       let confidenceText = viewModel.roadConfidenceText {
+                        Annotation("Road Confidence", coordinate: coordinate, anchor: .center) {
+                            RoadConfidenceBadge(text: confidenceText)
+                        }
+                    }
                 }
                 .overlay {
                     if viewModel.isPlacingInertialPin {
@@ -219,6 +227,16 @@ struct ContentView: View {
                             }
                         }
 
+                        InertialActionButton(action: viewModel.toggleRoadConfidenceVisibility) {
+                            Label(
+                                viewModel.isRoadConfidenceVisible ? "Hide Road Confidence" : "Show Road Confidence",
+                                systemImage: viewModel.isRoadConfidenceVisible ? "eye.slash.circle" : "road.lanes.curved.left"
+                            )
+                            .font(.caption.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                        }
+
                         InertialActionButton(action: viewModel.clearTrails) {
                             Label("Clear Trails", systemImage: "trash")
                                 .font(.caption.weight(.semibold))
@@ -398,6 +416,23 @@ private struct LegendItem: View {
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
         }
+    }
+}
+
+private struct RoadConfidenceBadge: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.caption2.weight(.bold))
+            .foregroundStyle(.primary)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(.ultraThinMaterial, in: Capsule())
+            .overlay(
+                Capsule()
+                    .strokeBorder(Color.orange.opacity(0.45), lineWidth: 1)
+            )
     }
 }
 

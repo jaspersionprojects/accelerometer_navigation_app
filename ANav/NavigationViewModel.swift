@@ -54,6 +54,7 @@ private struct RoadMatchState {
     var lastRefreshDate: Date
     var consecutiveMisses: Int
     var isLocked: Bool
+    var confidence: Double
 }
 
 @MainActor
@@ -71,12 +72,15 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
     @Published private(set) var gpsTrailCoordinates: [CLLocationCoordinate2D] = []
     @Published private(set) var inertialTrailCoordinates: [CLLocationCoordinate2D] = []
     @Published private(set) var areTrailsVisible = true
+    @Published private(set) var isRoadConfidenceVisible = false
     @Published private(set) var isPlacingInertialPin = false
     @Published private(set) var gpsSpeedMPH = 0.0
     @Published private(set) var inertialSpeedMPH = 0.0
     @Published private(set) var headingDegrees = 0.0
     @Published private(set) var isCalibrationRunning = false
     @Published private(set) var hasCompletedManualCalibration = false
+    @Published private(set) var roadConfidenceCoordinate: CLLocationCoordinate2D?
+    @Published private(set) var roadConfidenceValue: Double?
 
     var gpsSpeedText: String {
         String(format: "%.1f mph", gpsSpeedMPH)
@@ -100,6 +104,15 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         } else {
             return String(format: "%.1f m", separationMeters)
         }
+    }
+
+    var roadConfidenceText: String? {
+        guard let roadConfidenceValue else { return nil }
+        return String(format: "%.2f", roadConfidenceValue)
+    }
+
+    var displayedRoadConfidenceCoordinate: CLLocationCoordinate2D? {
+        roadConfidenceCoordinate
     }
 
     var canSnapToGPS: Bool {
@@ -127,6 +140,11 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
     private let stationaryHeadingDeltaThreshold = 6.0
     private let stationarySampleThreshold = 5
     private let stationaryBiasLearningRate = 0.02
+    private let headingTurnRateThresholdDegreesPerSecond = 12.0
+    private let headingFastCorrectionBlend = 0.18
+    private let headingSlowCorrectionBlend = 0.04
+    private let headingCorrectionAcceptDelta = 25.0
+    private let headingCorrectionIgnoreDelta = 80.0
     private let stoppedSpeedThreshold = 0.35
     private let roadMatchRefreshDistance = 12.0
     private let roadSnapMaximumDistance = 25.0
@@ -155,7 +173,10 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
     private var inertialOffsetMeters = SIMD2<Double>(repeating: 0)
     private var inertialVelocityMetersPerSecond = SIMD2<Double>(repeating: 0)
     private var lastMotionTimestamp: TimeInterval?
+    private var lastHeadingFusionTimestamp: TimeInterval?
+    private var externalHeadingDegrees: Double?
     private var motionHeadingDegrees: Double?
+    private var lastReferenceYawRateDegreesPerSecond = 0.0
     private var calibrationStartTimestamp: TimeInterval?
     private var calibrationSampleCount = 0
     private var calibrationAccelerationBiasAccumulator = SIMD3<Double>(repeating: 0)
@@ -228,6 +249,18 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         areTrailsVisible = false
     }
 
+    func showRoadConfidence() {
+        isRoadConfidenceVisible = true
+    }
+
+    func hideRoadConfidence() {
+        isRoadConfidenceVisible = false
+    }
+
+    func toggleRoadConfidenceVisibility() {
+        isRoadConfidenceVisible.toggle()
+    }
+
     func clearTrails() {
         gpsTrailCoordinates.removeAll()
         inertialTrailCoordinates.removeAll()
@@ -257,6 +290,8 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         accelerationBias = .zero
         rotationRateBias = .zero
         lastMotionTimestamp = nil
+        lastHeadingFusionTimestamp = nil
+        lastReferenceYawRateDegreesPerSecond = 0
         resetStationaryDetectionState()
         statusText = "Hold still for calibration."
     }
@@ -278,10 +313,13 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         inertialOffsetMeters = .zero
         inertialVelocityMetersPerSecond = .zero
         lastMotionTimestamp = nil
+        lastHeadingFusionTimestamp = nil
+        lastReferenceYawRateDegreesPerSecond = 0
         resetStationaryDetectionState()
         roadMatchTask?.cancel()
         roadMatchTask = nil
         roadMatchState = nil
+        updateRoadConfidenceDisplay(coordinate: nil, confidence: nil)
         inertialTrailCoordinates = [coordinate]
         replaceInertialAnnotation(with: coordinate)
         updateDerivedReadouts()
@@ -300,6 +338,7 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
             roadMatchTask?.cancel()
             roadMatchTask = nil
             roadMatchState = nil
+            updateRoadConfidenceDisplay(coordinate: nil, confidence: nil)
             statusText = "Walking mode leaves the inertial marker free-moving."
         }
 
@@ -339,9 +378,9 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         let magneticHeading = newHeading.magneticHeading
 
         if trueHeading >= 0 {
-            motionHeadingDegrees = normalize(angle: trueHeading)
+            externalHeadingDegrees = normalize(angle: trueHeading)
         } else if magneticHeading >= 0 {
-            motionHeadingDegrees = normalize(angle: magneticHeading)
+            externalHeadingDegrees = normalize(angle: magneticHeading)
         }
 
         updateDerivedReadouts()
@@ -400,8 +439,9 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
 
     private func handleDeviceMotion(_ motion: CMDeviceMotion) {
         if motion.heading >= 0 {
-            motionHeadingDegrees = normalize(angle: motion.heading)
+            externalHeadingDegrees = normalize(angle: motion.heading)
         }
+        updateFusedHeading(with: motion)
 
         let wasCalibrationRunning = isCalibrationRunning
         if isCalibrationRunning && !updateManualCalibration(with: motion) {
@@ -616,10 +656,13 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         inertialOrigin = location.coordinate
         rawInertialCoordinate = location.coordinate
         inertialOffsetMeters = .zero
+        lastHeadingFusionTimestamp = nil
+        lastReferenceYawRateDegreesPerSecond = 0
         resetStationaryDetectionState()
         roadMatchState = nil
         roadMatchTask?.cancel()
         roadMatchTask = nil
+        updateRoadConfidenceDisplay(coordinate: nil, confidence: nil)
 
         if location.speed >= 0, location.course >= 0 {
             inertialVelocityMetersPerSecond = velocityVector(from: location)
@@ -701,16 +744,18 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
 
     private func updateRoadMatchedCoordinate(using rawCoordinate: CLLocationCoordinate2D) {
         guard movementMode == .driving else {
+            updateRoadConfidenceDisplay(coordinate: nil, confidence: nil)
             replaceInertialAnnotation(with: rawCoordinate)
             return
         }
 
         let speedMetersPerSecond = simd_length(inertialVelocityMetersPerSecond)
-        let heading = courseDegrees(from: inertialVelocityMetersPerSecond)
+        let heading = effectiveTravelHeading(from: inertialVelocityMetersPerSecond)
         let snap = snapToCurrentRoute(rawCoordinate: rawCoordinate)
         let shouldStayRoadLocked = roadMatchState?.isLocked == true
 
         guard speedMetersPerSecond >= activeRoadMatchMinimumSpeed || shouldStayRoadLocked else {
+            updateRoadConfidenceDisplay(coordinate: nil, confidence: nil)
             replaceInertialAnnotation(with: rawCoordinate)
             return
         }
@@ -730,22 +775,39 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         snap: (coordinate: CLLocationCoordinate2D, progressDistance: Double, distanceFromRaw: Double)?
     ) {
         if let snap {
+            let confidence = roadConfidence(
+                rawCoordinate: rawCoordinate,
+                heading: heading,
+                snappedCoordinate: snap.coordinate,
+                progressDistance: snap.progressDistance,
+                routeCoordinates: roadMatchState?.routeCoordinates
+            )
             roadMatchState?.lastSnappedCoordinate = snap.coordinate
             roadMatchState?.lastProgressDistance = snap.progressDistance
             roadMatchState?.consecutiveMisses = 0
             roadMatchState?.isLocked = true
+            roadMatchState?.confidence = confidence
+            updateRoadConfidenceDisplay(coordinate: snap.coordinate, confidence: confidence)
             replaceInertialAnnotation(with: snap.coordinate)
         } else if let roadMatchState, roadMatchState.isLocked {
             self.roadMatchState?.consecutiveMisses = roadMatchState.consecutiveMisses + 1
+            let reducedConfidence = max(roadMatchState.confidence - 0.12, 0)
+            self.roadMatchState?.confidence = reducedConfidence
 
             if shouldReleaseDrivingLock(rawCoordinate: rawCoordinate) {
                 self.roadMatchState?.isLocked = false
                 self.roadMatchState?.consecutiveMisses = 0
+                updateRoadConfidenceDisplay(coordinate: nil, confidence: nil)
                 replaceInertialAnnotation(with: rawCoordinate)
             } else {
+                updateRoadConfidenceDisplay(
+                    coordinate: roadMatchState.lastSnappedCoordinate,
+                    confidence: reducedConfidence
+                )
                 replaceInertialAnnotation(with: roadMatchState.lastSnappedCoordinate)
             }
         } else {
+            updateRoadConfidenceDisplay(coordinate: nil, confidence: nil)
             replaceInertialAnnotation(with: rawCoordinate)
         }
 
@@ -853,7 +915,8 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
                     lastRefreshHeading: heading,
                     lastRefreshDate: Date(),
                     consecutiveMisses: 0,
-                    isLocked: wasLocked
+                    isLocked: wasLocked,
+                    confidence: 0
                 )
 
                 if let rawInertialCoordinate = self.rawInertialCoordinate,
@@ -862,15 +925,25 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
                     routeCoordinates: selectedRouteCoordinates,
                     lastProgressDistance: progressSeed
                    ) {
+                    let confidence = self.roadConfidence(
+                        rawCoordinate: rawInertialCoordinate,
+                        heading: heading,
+                        snappedCoordinate: match.coordinate,
+                        progressDistance: match.progressDistance,
+                        routeCoordinates: selectedRouteCoordinates
+                    )
                     nextRoadMatchState.lastSnappedCoordinate = match.coordinate
                     nextRoadMatchState.lastProgressDistance = match.progressDistance
                     nextRoadMatchState.consecutiveMisses = 0
                     nextRoadMatchState.isLocked = true
+                    nextRoadMatchState.confidence = confidence
                     self.roadMatchState = nextRoadMatchState
+                    self.updateRoadConfidenceDisplay(coordinate: match.coordinate, confidence: confidence)
                     self.replaceInertialAnnotation(with: match.coordinate)
                     self.updateRegion()
                 } else {
                     self.roadMatchState = nextRoadMatchState
+                    self.updateRoadConfidenceDisplay(coordinate: nil, confidence: nil)
                 }
             }
         }
@@ -930,6 +1003,31 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         }
 
         return abs(normalizedDeltaDegrees(heading, routeHeading))
+    }
+
+    private func roadConfidence(
+        rawCoordinate: CLLocationCoordinate2D,
+        heading: Double,
+        snappedCoordinate: CLLocationCoordinate2D,
+        progressDistance: Double,
+        routeCoordinates: [CLLocationCoordinate2D]?
+    ) -> Double {
+        let rawLocation = CLLocation(latitude: rawCoordinate.latitude, longitude: rawCoordinate.longitude)
+        let snappedLocation = CLLocation(latitude: snappedCoordinate.latitude, longitude: snappedCoordinate.longitude)
+        let snapDistance = rawLocation.distance(from: snappedLocation)
+        let distanceScore = max(0, 1 - (snapDistance / roadSnapMaximumDistance))
+
+        let routeHeading = routeCoordinates.flatMap { routeHeading(on: $0, near: progressDistance) } ?? heading
+        let headingDelta = abs(normalizedDeltaDegrees(heading, routeHeading))
+        let headingScore = max(0, 1 - (headingDelta / 90))
+
+        let missPenalty = min(Double(roadMatchState?.consecutiveMisses ?? 0) * 0.08, 0.4)
+        return min(max(distanceScore * 0.7 + headingScore * 0.3 - missPenalty, 0), 1)
+    }
+
+    private func updateRoadConfidenceDisplay(coordinate: CLLocationCoordinate2D?, confidence: Double?) {
+        roadConfidenceCoordinate = coordinate
+        roadConfidenceValue = confidence
     }
 
     private func bestRouteCoordinates(
@@ -1052,6 +1150,43 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         return courseDegrees(from: velocity)
     }
 
+    private func updateFusedHeading(with motion: CMDeviceMotion) {
+        let yawRateDegreesPerSecond = referenceVerticalRotationRateDegreesPerSecond(from: motion)
+        let currentExternalHeading = externalHeadingDegrees
+
+        defer {
+            lastHeadingFusionTimestamp = motion.timestamp
+            lastReferenceYawRateDegreesPerSecond = yawRateDegreesPerSecond
+        }
+
+        guard let currentFusedHeading = motionHeadingDegrees ?? currentExternalHeading else {
+            motionHeadingDegrees = currentExternalHeading
+            return
+        }
+
+        let deltaTime: Double
+        if let lastHeadingFusionTimestamp {
+            deltaTime = min(max(motion.timestamp - lastHeadingFusionTimestamp, 0), 0.2)
+        } else {
+            deltaTime = 0
+        }
+
+        var fusedHeading = normalize(angle: currentFusedHeading + yawRateDegreesPerSecond * deltaTime)
+
+        if let currentExternalHeading {
+            let headingDelta = normalizedDeltaDegrees(currentExternalHeading, fusedHeading)
+            let isTurning = abs(yawRateDegreesPerSecond) >= headingTurnRateThresholdDegreesPerSecond
+
+            if !isTurning && abs(headingDelta) <= headingCorrectionAcceptDelta {
+                fusedHeading = normalize(angle: fusedHeading + headingDelta * headingFastCorrectionBlend)
+            } else if abs(headingDelta) <= headingCorrectionIgnoreDelta {
+                fusedHeading = normalize(angle: fusedHeading + headingDelta * headingSlowCorrectionBlend)
+            }
+        }
+
+        motionHeadingDegrees = fusedHeading
+    }
+
     private func nearestPointOnSegment(
         to coordinate: CLLocationCoordinate2D,
         start: CLLocationCoordinate2D,
@@ -1084,7 +1219,7 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         inertialSpeedMPH = speedMetersPerSecond * 2.2369362920544
 
         if speedMetersPerSecond > stoppedSpeedThreshold {
-            headingDegrees = courseDegrees(from: inertialVelocityMetersPerSecond)
+            headingDegrees = effectiveTravelHeading(from: inertialVelocityMetersPerSecond)
         } else if let motionHeadingDegrees {
             headingDegrees = motionHeadingDegrees
         } else if let lastLocation, lastLocation.course >= 0 {
@@ -1188,9 +1323,37 @@ final class NavigationViewModel: NSObject, ObservableObject, CLLocationManagerDe
         return eastNorthAcceleration
     }
 
+    private func referenceVerticalRotationRateDegreesPerSecond(from motion: CMDeviceMotion) -> Double {
+        let rotationRate = calibratedRotationRate(from: motion)
+        let rotation = motion.attitude.rotationMatrix
+        let referenceZ =
+            rotation.m13 * rotationRate.x +
+            rotation.m23 * rotationRate.y +
+            rotation.m33 * rotationRate.z
+        return -referenceZ * 180 / .pi
+    }
+
     private func courseDegrees(from velocity: SIMD2<Double>) -> Double {
         let angleRadians = atan2(velocity.x, velocity.y)
         return normalize(angle: angleRadians * 180 / .pi)
+    }
+
+    private func effectiveTravelHeading(from velocity: SIMD2<Double>) -> Double {
+        let velocityHeading = courseDegrees(from: velocity)
+        let speedMetersPerSecond = simd_length(velocity)
+
+        guard let motionHeadingDegrees else { return velocityHeading }
+
+        if speedMetersPerSecond < 1.0 {
+            return motionHeadingDegrees
+        }
+
+        if abs(lastReferenceYawRateDegreesPerSecond) >= headingTurnRateThresholdDegreesPerSecond {
+            let headingDelta = normalizedDeltaDegrees(motionHeadingDegrees, velocityHeading)
+            return normalize(angle: velocityHeading + headingDelta * 0.35)
+        }
+
+        return velocityHeading
     }
 
     private func normalize(angle: Double) -> Double {
